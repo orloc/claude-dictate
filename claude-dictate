@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# claude-dictate — toggle voice dictation into a tmux session.
+#
+# Press once to start recording the mic. Press again to stop, transcribe
+# with whisper.cpp, and inject the text into the tmux session via send-keys
+# — no window focus required, so it works while a game owns your keyboard.
+#
+# Config: env vars, or set them in ~/.config/claude-dictate/config
+# (plain shell, sourced if present):
+#
+#   DICTATE_WHISPER   path to whisper-cli       (default: whisper-cli on PATH)
+#   DICTATE_MODEL     path to a ggml model      (required, no sane default)
+#   DICTATE_TARGET    tmux session to inject to (default: claude)
+set -u
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+[[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+
+WHISPER="${DICTATE_WHISPER:-$(command -v whisper-cli || true)}"
+MODEL="${DICTATE_MODEL:-}"
+TARGET="${DICTATE_TARGET:-claude}"
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+PIDFILE="$RUN_DIR/rec.pid"
+WAV="$RUN_DIR/rec.wav"
+
+notify() { # notify(urgency, timeout_ms, body)
+    command -v notify-send >/dev/null && notify-send -u "$1" -t "$2" "claude-dictate" "$3"
+}
+
+die() {
+    notify critical 5000 "$1"
+    echo "claude-dictate: $1" >&2
+    exit 1
+}
+
+# Collapse whisper output to one line and strip its non-speech markers
+# like [BLANK_AUDIO] or (coughing).
+clean_text() {
+    tr '\n' ' ' | sed -E 's/\[[A-Z_ ]+\]//g; s/\([a-z ]+\)//g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# Whisper reliably hallucinates these on silent or near-silent audio.
+is_hallucination() {
+    case "${1,,}" in
+        ""|you|you.|thank\ you.|thanks\ for\ watching!|.|bye.|bye) return 0 ;;
+    esac
+    return 1
+}
+
+start_recording() {
+    rm -f "$WAV"
+    pw-record --rate 16000 --channels 1 --format s16 "$WAV" &
+    echo $! > "$PIDFILE"
+    notify low 60000 "recording... press again to send"
+}
+
+stop_and_send() {
+    kill "$(cat "$PIDFILE")" 2>/dev/null
+    rm -f "$PIDFILE"
+    sleep 0.3  # let pw-record flush and close the wav
+
+    notify low 2000 "transcribing..."
+    local text
+    text=$("$WHISPER" -m "$MODEL" -f "$WAV" --no-prints --no-timestamps 2>/dev/null | clean_text)
+
+    if is_hallucination "$text"; then
+        notify critical 3000 "heard nothing"
+        return 0
+    fi
+
+    tmux has-session -t "$TARGET" 2>/dev/null \
+        || die "no tmux session '$TARGET' — start one with: tmux new -s $TARGET claude"
+
+    tmux send-keys -t "$TARGET" -l "$text"
+    tmux send-keys -t "$TARGET" Enter
+    notify normal 4000 "➜ $text"
+}
+
+main() {
+    [[ -x "$WHISPER" ]] || die "whisper-cli not found — set DICTATE_WHISPER in $CONFIG_FILE"
+    [[ -f "$MODEL" ]] || die "model not found — set DICTATE_MODEL in $CONFIG_FILE"
+    mkdir -p "$RUN_DIR"
+
+    if [[ -f "$PIDFILE" ]]; then
+        stop_and_send
+    else
+        start_recording
+    fi
+}
+
+# Run main unless we're being sourced (e.g. by the tests).
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && main
