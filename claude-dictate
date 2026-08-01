@@ -16,8 +16,24 @@
 #                     (default: pw-record --rate 16000 --channels 1 --format s16)
 set -u
 
+notify() { # notify(urgency, timeout_ms, body)
+    command -v notify-send >/dev/null && notify-send -u "$1" -t "$2" "claude-dictate" "$3"
+    return 0
+}
+
+die() {
+    notify critical 5000 "$1"
+    echo "claude-dictate: $1" >&2
+    exit 1
+}
+
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
-[[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null || die "syntax error in $CONFIG_FILE"
+    set +u
+    . "$CONFIG_FILE"
+    set -u
+fi
 
 WHISPER="${DICTATE_WHISPER:-whisper-cli}"
 MODEL="${DICTATE_MODEL:-}"
@@ -31,26 +47,19 @@ WAV="$RUN_DIR/rec.wav"
 # Below ~0.5s of 16kHz mono s16 audio there's nothing worth transcribing.
 MIN_WAV_BYTES=16000
 
-notify() { # notify(urgency, timeout_ms, body)
-    command -v notify-send >/dev/null && notify-send -u "$1" -t "$2" "claude-dictate" "$3"
-}
-
-die() {
-    notify critical 5000 "$1"
-    echo "claude-dictate: $1" >&2
-    exit 1
-}
-
+# Collapse to one line and strip whisper's non-speech markers — a belt for
+# --suppress-nst's suspenders; markers like [BLANK_AUDIO]/(coughing) still
+# slip through it occasionally.
 clean_text() {
-    tr -s '[:space:]' ' ' | sed -E 's/^ //; s/ $//'
+    tr '\n' ' ' | sed -E 's/\[[A-Z_ ]+\]//g; s/\([a-z ]+\)//g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
 # Whisper hallucinates these on quiet audio that slips past the size gate.
 is_hallucination() {
     local t="${1,,}"
-    t="${t%.}"
+    while [[ "$t" == *[.!?] ]]; do t="${t%?}"; done
     case "$t" in
-        ""|you|thank\ you|thanks\ for\ watching!|bye) return 0 ;;
+        ""|you|thank\ you|thanks\ for\ watching|bye) return 0 ;;
     esac
     return 1
 }
@@ -58,17 +67,33 @@ is_hallucination() {
 start_recording() {
     rm -f "$WAV"
     $RECORDER "$WAV" &
-    echo $! > "$PIDFILE"
+    local pid=$!
+    sleep 0.1
+    kill -0 "$pid" 2>/dev/null || die "recorder failed to start: $RECORDER"
+    # noclobber write arbitrates hotkey double-fires: the loser kills its
+    # recorder and bows out
+    if ! (set -o noclobber; echo "$pid" > "$PIDFILE") 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        exit 0
+    fi
     notify low 60000 "recording... press again to send"
 }
 
 stop_and_send() {
-    local pid
-    pid=$(cat "$PIDFILE")
-    rm -f "$PIDFILE"
-    kill "$pid" 2>/dev/null
-    # wait for the recorder to flush and close the wav (not our child, so no `wait`)
-    timeout 2 tail --pid="$pid" -f /dev/null
+    local claimed="$1" pid
+    pid=$(cat "$claimed")
+    rm -f "$claimed"
+
+    # only signal if the PID still belongs to our recorder — a stale pidfile
+    # must not kill whatever process recycled the PID (cmdline, not comm:
+    # interpreter-script recorders show up as e.g. "bash")
+    local rec_name
+    rec_name=$(basename "${RECORDER%% *}")
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$rec_name"; then
+        kill "$pid" 2>/dev/null
+        # wait for the recorder to flush and close the wav (not our child, so no `wait`)
+        timeout 2 tail --pid="$pid" -f /dev/null
+    fi
 
     if (( $(stat -c%s "$WAV" 2>/dev/null || echo 0) < MIN_WAV_BYTES )); then
         notify critical 3000 "heard nothing"
@@ -87,10 +112,13 @@ stop_and_send() {
         return 0
     fi
 
-    tmux has-session -t "$TARGET" 2>/dev/null \
+    tmux has-session -t "=$TARGET" 2>/dev/null \
         || die "no tmux session '$TARGET' — start one with: tmux new -s $TARGET claude"
 
-    tmux send-keys -t "$TARGET" -l "$text" \; send-keys -t "$TARGET" Enter
+    # tmux argv parsing eats a trailing unescaped ';' — escape it
+    [[ "$text" == *\; ]] && text="${text%;}\\;"
+    tmux send-keys -t "=$TARGET:" -l -- "$text" \; send-keys -t "=$TARGET:" Enter \
+        || die "tmux send-keys failed"
     notify normal 4000 "➜ $text"
 }
 
@@ -99,12 +127,17 @@ main() {
     [[ -f "$MODEL" ]] || die "model not found — set DICTATE_MODEL in $CONFIG_FILE"
     mkdir -p "$RUN_DIR"
 
-    if [[ -f "$PIDFILE" ]]; then
-        stop_and_send
+    # mv atomically claims the pidfile: exactly one of two racing stop
+    # presses wins; the loser (or a plain start press) falls through
+    local claimed="$PIDFILE.claimed.$$"
+    if mv "$PIDFILE" "$claimed" 2>/dev/null; then
+        stop_and_send "$claimed"
     else
         start_recording
     fi
 }
 
 # Run main unless we're being sourced (e.g. by the tests).
-[[ "${BASH_SOURCE[0]}" == "$0" ]] && main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
+fi
