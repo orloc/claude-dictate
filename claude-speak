@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# claude-speak — speak a Claude Code response aloud with Kokoro neural TTS.
+#
+# Reads text on stdin, strips it down to something worth listening to (code
+# blocks, tables and paths are unspeakable), then synthesizes and plays it.
+# Synthesis runs a chunk ahead of playback so speech starts in about a second
+# instead of after the whole response is rendered.
+#
+# Called with --stop it kills any in-flight playback, which is how the dictate
+# hotkey barges in mid-sentence.
+#
+# Config: env vars, or set them in ~/.config/claude-dictate/config (shared with
+# claude-dictate; plain shell, sourced if present):
+#
+#   SPEAK_ENABLED       0 to mute entirely            (default: 1)
+#   SPEAK_ENGINE        sherpa-onnx-offline-tts path  (default: 99dps cache)
+#   SPEAK_MODEL_DIR     kokoro model dir              (default: 99dps cache)
+#   SPEAK_SID           voice index, 0-10             (default: 1, af_bella)
+#   SPEAK_LENGTH_SCALE  larger is slower              (default: 1.1)
+#   SPEAK_MAX_CHARS     cap before truncating         (default: 1200)
+#   SPEAK_SINK          output sink to play through   (default: the mic's card)
+set -u
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+PGID_FILE="$RUN_DIR/speak.pgid"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+fi
+
+# Default to the assets 99dps already downloaded — ~120MB we don't need twice.
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/99dps/tts"
+ENGINE="${SPEAK_ENGINE:-$CACHE/engine/sherpa-onnx-v1.13.2-linux-x64-shared/bin/sherpa-onnx-offline-tts}"
+MODEL_DIR="${SPEAK_MODEL_DIR:-$CACHE/model/kokoro-int8-en-v0_19}"
+SID="${SPEAK_SID:-1}"
+LENGTH_SCALE="${SPEAK_LENGTH_SCALE:-0.85}"
+MAX_CHARS="${SPEAK_MAX_CHARS:-1200}"
+ENABLED="${SPEAK_ENABLED:-1}"
+
+# --- output device ----------------------------------------------------------
+
+# Reply through the headset you're talking into, not whatever the system
+# default sink happens to be. The capture and playback nodes of one card share
+# a name stem — alsa_input.<stem>.<profile> / alsa_output.<stem>.<profile> — so
+# the mic the recorder is pinned to names the sink to answer through.
+recorder_target() {
+    local prev="" w
+    for w in ${DICTATE_RECORDER:-}; do
+        [[ "$prev" == "--target" ]] && { printf '%s' "$w"; return 0; }
+        [[ "$w" == --target=* ]] && { printf '%s' "${w#--target=}"; return 0; }
+        prev="$w"
+    done
+}
+
+sink_for_source() {
+    local src="$1" stem name
+    [[ "$src" == alsa_input.* ]] || return 0
+    stem="${src#alsa_input.}"
+    stem="${stem%.*}"
+    while read -r _ name _; do
+        [[ "$name" == "alsa_output.$stem."* ]] && { printf '%s' "$name"; return 0; }
+    done < <(pactl list short sinks 2>/dev/null)
+}
+
+SINK="${SPEAK_SINK:-}"
+[[ -n "$SINK" ]] || SINK=$(sink_for_source "$(recorder_target)")
+
+# --- stop -------------------------------------------------------------------
+
+# Kill the whole detached process group, so an in-flight sherpa or player dies
+# with it rather than finishing the sentence after we've been told to shut up.
+stop_playback() {
+    local pgid
+    pgid=$(cat "$PGID_FILE" 2>/dev/null) || return 0
+    rm -f "$PGID_FILE"
+    [[ "$pgid" =~ ^[0-9]+$ ]] || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null
+    return 0
+}
+
+if [[ "${1:-}" == "--stop" ]]; then
+    stop_playback
+    exit 0
+fi
+
+# --- detach -----------------------------------------------------------------
+
+# The Stop hook must return immediately (it has a timeout, and playback can run
+# for a minute), so the first pass only slurps stdin and re-execs itself into
+# its own session. Being a session leader is also what makes the group kill in
+# stop_playback work.
+if [[ "${1:-}" != "--speak" ]]; then
+    mkdir -p "$RUN_DIR"
+    utt="$RUN_DIR/utt.$$.txt"
+    cat > "$utt"
+    [[ -s "$utt" ]] || { rm -f "$utt"; exit 0; }
+    [[ "$ENABLED" == "1" ]] || { rm -f "$utt"; exit 0; }
+    setsid --fork "$0" --speak "$utt" >/dev/null 2>&1 </dev/null
+    exit 0
+fi
+
+# --- detached from here -----------------------------------------------------
+
+UTT="${2:-}"
+[[ -f "$UTT" ]] || exit 0
+cleanup() { rm -f "$UTT" "$WORK"/*.wav 2>/dev/null; rmdir "$WORK" 2>/dev/null; }
+
+# A new response supersedes whatever is still being read out.
+stop_playback
+
+command -v "$ENGINE" >/dev/null || { rm -f "$UTT"; exit 0; }
+[[ -f "$MODEL_DIR/model.int8.onnx" ]] || { rm -f "$UTT"; exit 0; }
+
+ps -o pgid= -p $$ | tr -d ' ' > "$PGID_FILE"
+
+WORK=$(mktemp -d "$RUN_DIR/speak.XXXXXX") || exit 0
+trap cleanup EXIT
+
+# Reduce markdown to speech and split it into sentence-sized chunks, one per
+# line. Chunking is what lets synthesis run ahead of playback.
+mapfile -t CHUNKS < <(MAX_CHARS="$MAX_CHARS" python3 - "$UTT" <<'PY'
+import os, re, sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+
+# Unspeakable structure goes first, before anything unwraps it into prose.
+text = re.sub(r"```.*?```", " ", text, flags=re.S)
+text = re.sub(r"~~~.*?~~~", " ", text, flags=re.S)
+text = "\n".join(l for l in text.split("\n") if not l.lstrip().startswith("|"))
+
+text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)   # [text](url) -> text
+text = re.sub(r"https?://\S+", "link", text)
+text = re.sub(r"`([^`]*)`", r"\1", text)               # keep inline code content
+
+# A path read aloud is a wall of "slash". Its basename carries the meaning.
+text = re.sub(r"(?:/[\w.\-]+){2,}/?", lambda m: m.group(0).rstrip("/").split("/")[-1], text)
+
+text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)        # headers
+text = re.sub(r"^\s*(?:[-*+]|\d+\.)\s+", "", text, flags=re.M)   # list markers
+text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+text = re.sub(r"(?<!\w)[*_]([^*_\n]+)[*_](?!\w)", r"\1", text)
+
+text = text.translate(str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "—": ", ", "–": ", ", "…": ".",
+}))
+text = re.sub(r"[^\x00-\x7f]", " ", text)   # emoji, box drawing, arrows
+
+# Each line becomes its own sentence so bullet lists don't run together.
+lines = []
+for line in text.split("\n"):
+    line = re.sub(r"\s+", " ", line).strip()
+    if not line:
+        continue
+    if line[-1] not in ".!?:,;":
+        line += "."
+    lines.append(line)
+text = " ".join(lines)
+text = re.sub(r"\s+", " ", text).strip()
+
+cap = int(os.environ.get("MAX_CHARS", "1200"))
+if len(text) > cap:
+    cut = text.rfind(" ", 0, cap)
+    text = text[: cut if cut > 0 else cap] + ". Response truncated."
+
+if not re.search(r"[A-Za-z]", text):
+    sys.exit(0)
+
+# Greedily pack sentences into chunks. The opening chunk is deliberately short:
+# nothing is audible until it finishes rendering, so it sets time-to-first-word.
+# Later chunks render while earlier ones play, so they can be longer — which
+# keeps prosody natural rather than clipped sentence by sentence.
+FIRST, REST = 90, 240
+sentences = re.findall(r"[^.!?]*[.!?]+|\S[^.!?]*$", text)
+chunk, out = "", []
+for s in sentences:
+    s = s.strip()
+    if not s:
+        continue
+    limit = FIRST if not out else REST
+    if chunk and len(chunk) + len(s) + 1 > limit:
+        out.append(chunk)
+        chunk = s
+    else:
+        chunk = f"{chunk} {s}".strip()
+if chunk:
+    out.append(chunk)
+
+for c in out:
+    print(c)
+PY
+)
+
+(( ${#CHUNKS[@]} )) || exit 0
+
+synth() { # synth(text, out.wav)
+    "$ENGINE" \
+        --kokoro-model="$MODEL_DIR/model.int8.onnx" \
+        --kokoro-voices="$MODEL_DIR/voices.bin" \
+        --kokoro-tokens="$MODEL_DIR/tokens.txt" \
+        --kokoro-data-dir="$MODEL_DIR/espeak-ng-data" \
+        --kokoro-length-scale="$LENGTH_SCALE" \
+        --sid="$SID" \
+        --num-threads=4 \
+        --output-filename="$2" \
+        "$1" >/dev/null 2>&1
+}
+
+play() { # blocks until the clip finishes — that's what serializes chunks
+    # A pinned sink is a preference, not a requirement: if the headset is off
+    # its node is gone, and falling through to the default device is better
+    # than silence.
+    if [[ -n "$SINK" ]]; then
+        command -v pw-play >/dev/null &&
+            pw-play --target "$SINK" "$1" 2>/dev/null && return
+        command -v paplay >/dev/null &&
+            paplay --device="$SINK" "$1" 2>/dev/null && return
+    fi
+    if command -v paplay >/dev/null; then paplay "$1" 2>/dev/null
+    elif command -v aplay >/dev/null; then aplay -q "$1" 2>/dev/null
+    else ffplay -nodisp -autoexit -loglevel quiet "$1" 2>/dev/null
+    fi
+}
+
+# Synthesize chunk 0, then keep one chunk in flight ahead of the speaker: while
+# chunk i plays, chunk i+1 renders. Time-to-first-word is one short chunk.
+synth "${CHUNKS[0]}" "$WORK/0.wav" || exit 0
+for (( i = 0; i < ${#CHUNKS[@]}; i++ )); do
+    next=$(( i + 1 ))
+    if (( next < ${#CHUNKS[@]} )); then
+        synth "${CHUNKS[$next]}" "$WORK/$next.wav" &
+        synth_pid=$!
+    else
+        synth_pid=""
+    fi
+
+    [[ -s "$WORK/$i.wav" ]] && play "$WORK/$i.wav"
+    rm -f "$WORK/$i.wav"
+
+    [[ -n "$synth_pid" ]] && wait "$synth_pid"
+done
+
+rm -f "$PGID_FILE"

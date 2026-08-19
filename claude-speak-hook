@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# claude-speak-hook — Claude Code Stop hook that reads the reply out loud.
+#
+# Wired into ~/.claude/settings.json as a Stop hook. Receives the hook payload
+# as JSON on stdin, pulls the final prose out of it, and hands it to
+# claude-speak (which detaches immediately, so the hook never blocks the turn).
+#
+# Gating matters: a user-level hook fires for EVERY Claude Code session on the
+# machine. Only the dictation tmux session should talk back, so a session that
+# isn't the target stays silent — work sessions and one-off terminals included.
+set -u
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+fi
+TARGET="${DICTATE_TARGET:-claude}"
+
+payload=$(cat)
+
+# A hook that blocked once re-fires as Claude works to satisfy it; speaking
+# again on the repeat would stutter the same reply.
+[[ "$(jq -r '.stop_hook_active // false' <<<"$payload" 2>/dev/null)" == "true" ]] && exit 0
+
+# Only speak for the dictation session. $TMUX_PANE is inherited from the pane
+# claude runs in; query by pane rather than by client, which is ambiguous when
+# several clients are attached.
+pane="${TMUX_PANE:-}"
+[[ -n "$pane" ]] || exit 0
+session=$(tmux display-message -t "$pane" -p '#{session_name}' 2>/dev/null) || exit 0
+[[ "$session" == "$TARGET" ]] || exit 0
+
+text=$(jq -r '.last_assistant_message // empty' <<<"$payload" 2>/dev/null)
+
+# Older payloads don't carry the message; fall back to the last text block in
+# the transcript (tool_use/thinking blocks carry no prose worth speaking).
+if [[ -z "$text" ]]; then
+    tp=$(jq -r '.transcript_path // empty' <<<"$payload" 2>/dev/null)
+    [[ -f "$tp" ]] && text=$(jq -r 'select(.type=="assistant")
+        | .message.content[]? | select(.type=="text") | .text' "$tp" 2>/dev/null | tail -40)
+fi
+
+[[ -n "$text" ]] || exit 0
+
+# Resolve the sibling script rather than trusting PATH — a hook's environment
+# doesn't necessarily carry ~/.local/bin.
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+printf '%s' "$text" | "$here/claude-speak"
+
+exit 0

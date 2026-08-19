@@ -1,6 +1,6 @@
 # claude-dictate
 
-Talk to a Claude Code session while your hands are busy.
+Talk to a Claude Code session while your hands are busy — and have it talk back.
 
 I built this so I could keep a Claude session moving while gaming — hands on
 mouse and keyboard, game owns the focus, but I still want to answer Claude's
@@ -8,6 +8,9 @@ questions or queue up the next task. It's a ~150 line bash script: bind it to
 a hotkey, press once to record, press again to transcribe and send. The text
 lands in a tmux session via `send-keys`, so window focus is never touched and
 the game never notices.
+
+`claude-speak` closes the loop, reading Claude's replies out loud so you never
+have to look at the terminal at all.
 
 ## How it works
 
@@ -27,6 +30,12 @@ Claude just runs in tmux: `tmux new -s claude claude`.
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and a ggml model
 - `notify-send` for desktop notifications (optional — degrades silently)
 - An X11 WM or hotkey daemon to bind the script to a key
+
+For speech (all optional — without them `claude-speak` no-ops):
+
+- `python3` and `jq`
+- a sherpa-onnx offline-TTS build and a Kokoro model (see Talking back)
+- `paplay`, `aplay` or `ffplay` for playback
 
 ## Install
 
@@ -69,21 +78,114 @@ already has. The script is just a toggle; press it however you like.
 
 A notification shows what was sent so you know it heard you right.
 
+## Talking back
+
+`claude-speak` reads Claude's replies aloud with [Kokoro][kokoro] neural TTS,
+driven through the [sherpa-onnx][sherpa] offline-TTS CLI. It's wired in as a
+Claude Code `Stop` hook, so it fires whenever Claude finishes a response.
+
+A response is markdown, and most of markdown is unlistenable — so the text is
+reduced before it's spoken: fenced code blocks and tables are dropped, link
+text is kept but URLs aren't, long paths collapse to their basename, and
+bullets become sentences so the list doesn't run together. Anything past
+`SPEAK_MAX_CHARS` is cut with a spoken "response truncated".
+
+Synthesis runs about 2× faster than real time, so rendering a long reply up
+front would mean waiting half a minute to hear the first word. Instead the
+text is split into chunks and synthesis runs one chunk ahead of playback. The
+opening chunk is capped short (90 chars) because nothing is audible until it
+finishes — that's what sets time-to-first-word, and it lands around a second,
+most of which is model load. Later chunks render while earlier ones play, so
+they're allowed to be longer and keep the prosody natural.
+
+Set it up by symlinking both scripts onto your PATH:
+
+```sh
+ln -s "$PWD/claude-dictate/claude-speak"      ~/.local/bin/claude-speak
+ln -s "$PWD/claude-dictate/claude-speak-hook" ~/.local/bin/claude-speak-hook
+```
+
+then adding the hooks to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "claude-speak-hook", "timeout": 10 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "claude-speak --stop", "timeout": 5 }] }
+    ]
+  }
+}
+```
+
+The engine and voice default to the assets [99dps][99dps] downloads for its
+combat cues (`~/.cache/99dps/tts`), since that's ~120MB there's no reason to
+keep twice. Point `SPEAK_ENGINE`/`SPEAK_MODEL_DIR` elsewhere if you'd rather
+install them standalone; with neither present, `claude-speak` silently no-ops.
+
+Two details worth knowing:
+
+- **It only speaks for the dictation session.** A user-level hook fires for
+  every Claude Code session on the machine, which would mean your work
+  terminals talking at you. The hook checks the tmux session name against
+  `DICTATE_TARGET` and stays silent anywhere else.
+- **Speech is interruptible.** Playback runs detached in its own process
+  group; `claude-speak --stop` kills it mid-word. That's wired to two things —
+  submitting a prompt (the `UserPromptSubmit` hook) and starting a recording,
+  so pressing the dictate hotkey while Claude is mid-sentence shuts it up
+  before the mic opens rather than recording your own speakers.
+- **It answers through the headset you're talking into.** The reply would
+  otherwise go to the system default sink, which is a different device than
+  the pinned mic as often as not. The capture and playback nodes of one card
+  share a name stem, so the mic named in `DICTATE_RECORDER --target` picks the
+  sink to answer through — no second thing to configure, and no changing your
+  system defaults. `SPEAK_SINK` overrides it, and if the pinned sink is gone
+  (headset powered off) playback falls back to the default device rather than
+  going silent.
+
+[kokoro]: https://huggingface.co/hexgrad/Kokoro-82M
+[sherpa]: https://github.com/k2-fsa/sherpa-onnx
+[99dps]: https://github.com/orloc/99dps
+
 ## Config
 
-All env vars, or set them in `~/.config/claude-dictate/config`:
+All env vars, or set them in `~/.config/claude-dictate/config` (both scripts
+read the same file):
 
 | var | default | what |
 |---|---|---|
 | `DICTATE_WHISPER` | `whisper-cli` on PATH | whisper-cli binary |
 | `DICTATE_MODEL` | none (required) | path to a ggml model |
-| `DICTATE_TARGET` | `claude` | tmux session to inject into |
+| `DICTATE_TARGET` | `claude` | tmux session to inject into, and the only one spoken to |
 | `DICTATE_RECORDER` | `pw-record --rate 16000 --channels 1 --format s16` | record command; gets the output .wav appended |
+| `DICTATE_SUBMIT_DELAY` | `0.5` | pause between the text and the Enter that submits it |
+| `SPEAK_ENABLED` | `1` | `0` mutes speech entirely |
+| `SPEAK_ENGINE` | 99dps cache | `sherpa-onnx-offline-tts` binary |
+| `SPEAK_MODEL_DIR` | 99dps cache | Kokoro model directory |
+| `SPEAK_SID` | `1` (af_bella) | voice index, 0–10 |
+| `SPEAK_LENGTH_SCALE` | `0.85` | larger is slower; below ~0.8 gets mushy |
+| `SPEAK_MAX_CHARS` | `1200` | cap before the reply is truncated |
+| `SPEAK_SINK` | the mic's card | output sink to play through |
 
 ## Notes / quirks
 
 - Recordings under ~0.5s are dropped ("heard nothing") — stops accidental
   double-presses from sending garbage.
+- **The Enter that submits a transcript must be its own keystroke, sent after
+  a pause.** Chained onto the text in one `tmux send-keys` call, both land in
+  a single read and the TUI swallows the newline into the text it's still
+  ingesting — the transcript sits in the prompt box, dictated but never sent.
+  Measured against a live session: chained never submits, a 0.4s gap always
+  does. `DICTATE_SUBMIT_DELAY` (0.5s) is the gap; raise it if submits still
+  get missed on a slower box.
+- `pw-record` follows the *default* PipeWire source, which is not necessarily
+  a microphone — on my box it was the USB interface's S/PDIF input, and every
+  recording came back as silence that whisper dutifully hallucinated a "you"
+  onto. If dictation reports "heard nothing" every time, check the level of
+  `$XDG_RUNTIME_DIR/claude-dictate/rec.wav` before suspecting whisper, and pin
+  the mic with `--target` in `DICTATE_RECORDER`.
 - Whisper hallucinates on near-silent audio — "you", "thank you", "thanks for
   watching!" — so a short blocklist filters those out too.
 - Use the CUDA build of whisper.cpp if you can. On an RTX 4070 with
@@ -100,6 +202,10 @@ All env vars, or set them in `~/.config/claude-dictate/config`:
 `./tests/run-tests.sh` — plain bash, no frameworks. Fakes the recorder,
 whisper, and notifications; injects into a real throwaway tmux session on a
 private socket.
+
+`./tests/run-speak-tests.sh` — same style for the speech side. A fake sherpa
+CLI logs the text it was asked to synthesize, so the assertions are about what
+would actually be spoken rather than about the cleaning regexes in isolation.
 
 ## License
 
