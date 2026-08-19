@@ -75,12 +75,13 @@ eq "callsign mid-sentence does not close"        "$(try_terminal 'skylark out of
 echo "# state machine"
 # Replace every side effect with a recorder, so a session can be driven and,
 # more importantly, so we can assert nothing was dictated.
-SPOKEN=""; SENT=""; TONES=""
+SPOKEN=""; SENT=""; TONES=""; NOTES=""
 NEXT_TEXT=""
 transcribe()  { printf '%s' "$NEXT_TEXT"; }
 tone()        { TONES="${TONES:+$TONES }$1"; }
 speak()       { SPOKEN="${SPOKEN:+$SPOKEN | }$1"; }
 send_buffer() { SENT="${SENT:+$SENT | }$1"; }
+notify()      { NOTES="${NOTES:+$NOTES | }$3"; }   # also keeps real popups out of a test run
 log()         { :; }
 
 say() { NEXT_TEXT="$1"; handle "$SANDBOX/nonexistent.wav"; }
@@ -142,6 +143,29 @@ STATE=transmitting; BUFFER="a long thought"; SENT=""; TX_START=$SECONDS; MAX_TX=
 check_timeout
 eq "timeout closes the mic"  "$STATE" "standby"
 eq "timeout sends the buffer" "$SENT" "a long thought"
+
+# --- desktop notifications --------------------------------------------------
+# The mic state has to be visible without listening for a tone, so the open /
+# building / sent transitions each say something.
+echo "# notifications"
+STATE=standby; BUFFER=""; SENT=""; NOTES=""
+say "skylark come in"
+if grep -qF "mic open" <<<"$NOTES"; then ok "opening the mic notifies"
+else no "opening the mic notifies" "notes: $NOTES"; fi
+
+NOTES=""
+say "check the parser"
+if grep -qF "check the parser" <<<"$NOTES"; then ok "notification echoes the transmission as it builds"
+else no "notification echoes the transmission as it builds" "notes: $NOTES"; fi
+
+NOTES=""
+say "skylark disregard"
+if grep -qF "discarded" <<<"$NOTES"; then ok "discarding notifies"
+else no "discarding notifies" "notes: $NOTES"; fi
+
+NOTES=""
+say "hey what about the parser"
+eq "standby speech notifies nothing" "$NOTES" ""
 
 # --- listener liveness ------------------------------------------------------
 # A pidfile is a claim, not proof: a crashed listener leaves one behind, and a

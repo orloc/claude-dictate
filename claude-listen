@@ -45,6 +45,7 @@ fi
 WHISPER="${DICTATE_WHISPER:-whisper-cli}"
 MODEL="${DICTATE_MODEL:-}"
 RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
+TARGET="${DICTATE_TARGET:-claude}"
 CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
 ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark}"
 MAX_TX="${LISTEN_MAX_TX:-90}"
@@ -175,8 +176,13 @@ transcribe() {
 
 send_buffer() {
     local text="$1"
-    [[ -n "$text" ]] || { tone err; return 0; }
-    "$HERE/claude-dictate" --send "$text" && log "sent: $text"
+    [[ -n "$text" ]] || { tone err; notify critical 3000 "nothing to send"; return 0; }
+    if "$HERE/claude-dictate" --send "$text"; then
+        log "sent: $text"
+        notify normal 5000 "➜ $text"
+    else
+        notify critical 5000 "could not reach the '$TARGET' tmux session"
+    fi
 }
 
 handle() {
@@ -192,11 +198,14 @@ handle() {
         act=$(standalone_command "$norm") || { log "ignored: $norm"; return 0; }
         case "$act" in
             open)   STATE=transmitting; BUFFER=""; TX_START=$SECONDS
-                    tone open; log "mic open" ;;
-            hush)   "$HERE/claude-speak" --stop; tone ack ;;
-            status) speak "Standing by." ;;
-            help)   speak "$(help_text)" ;;
-            close|cancel) tone err; log "close command with mic already shut" ;;
+                    tone open; log "mic open"
+                    notify low 90000 "🔴 mic open — \"$CALLSIGN, out\" to send" ;;
+            hush)   "$HERE/claude-speak" --stop; tone ack
+                    notify low 2000 "stopped speaking" ;;
+            status) speak "Standing by."; notify low 3000 "standing by" ;;
+            help)   speak "$(help_text)"; notify low 6000 "reading out the protocol" ;;
+            close|cancel) tone err; log "close command with mic already shut"
+                    notify critical 3000 "mic is already closed" ;;
         esac
         return 0
     fi
@@ -208,13 +217,17 @@ handle() {
             close)  [[ -n "$rest" ]] && BUFFER="${BUFFER:+$BUFFER }$rest"
                     STATE=standby; tone close
                     send_buffer "$BUFFER"; BUFFER="" ;;
-            cancel) STATE=standby; BUFFER=""; tone abort; log "discarded" ;;
+            cancel) STATE=standby; BUFFER=""; tone abort; log "discarded"
+                    notify normal 2500 "discarded" ;;
         esac
         return 0
     fi
 
     BUFFER="${BUFFER:+$BUFFER }$text"
     log "buffered: $text"
+    # Echo the transmission as it builds, so you can see it heard you right
+    # without waiting until after it's been sent.
+    notify low 90000 "🔴 $BUFFER"
 }
 
 # A missed "out" would otherwise hold the channel open forever, so a long
@@ -223,14 +236,25 @@ check_timeout() {
     [[ "$STATE" == transmitting ]] || return 0
     (( SECONDS - TX_START < MAX_TX )) && return 0
     log "max transmission reached — sending"
+    notify normal 4000 "max transmission reached — sending"
     STATE=standby; tone close
     send_buffer "$BUFFER"; BUFFER=""
 }
 
 # ------------------------------------------------------------------ control --
 
+# notify(urgency, timeout_ms, body). Same shape as claude-dictate's.
+#
+# The listener's notifications describe one changing thing — what the mic is
+# doing right now — so they replace each other in place rather than stacking a
+# column of stale state. The id comes from the daemon (-p) instead of being
+# hardcoded, so we can't collide with another app's notification.
+NOTIFY_ID=""
 notify() {
-    command -v notify-send >/dev/null && notify-send -u low -t "$1" "claude-listen" "$2"
+    command -v notify-send >/dev/null || return 0
+    local args=(-u "$1" -t "$2") id
+    [[ -n "$NOTIFY_ID" ]] && args+=(-r "$NOTIFY_ID")
+    id=$(notify-send -p "${args[@]}" "claude-listen" "$3" 2>/dev/null) && NOTIFY_ID="$id"
     return 0
 }
 
@@ -246,22 +270,22 @@ listener_pid() {
 
 start_listener() {
     if listener_pid >/dev/null; then
-        notify 2000 "already listening"
+        notify low 2000 "already listening"
         return 0
     fi
     mkdir -p "$(dirname "$PIDFILE")"
     make_tones
     setsid --fork "$0" --run >/dev/null 2>&1 </dev/null
     tone on
-    notify 3000 "listening — say \"$CALLSIGN, come in\""
+    notify low 4000 "listening — say \"$CALLSIGN, come in\""
 }
 
 stop_listener() {
     local p
-    p=$(listener_pid) || { notify 2000 "not listening"; return 0; }
+    p=$(listener_pid) || { notify low 2000 "not listening"; return 0; }
     kill -TERM "$p" 2>/dev/null
     tone off
-    notify 3000 "stopped listening"
+    notify low 3000 "stopped listening"
 }
 
 status_listener() {

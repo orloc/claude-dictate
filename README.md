@@ -210,6 +210,13 @@ close, a descending triple for discard, a low buzz for a command that made no
 sense. You hear these constantly and you're not looking at the screen, so
 words would wear out fast.
 
+Desktop notifications carry the same states for when you *are* looking: mic
+opened, the transmission echoed back as it builds so you can see it heard you
+right, what was finally sent, discards, and errors. They describe one changing
+thing, so each replaces the last in place rather than stacking a column of
+stale state — the id comes from the daemon rather than being hardcoded, so it
+can't collide with another app's notification.
+
 Speech is found by energy against a *rolling* estimate of the noise floor
 rather than a fixed threshold, since mic gain and room noise move around; the
 floor only learns from quiet frames, so a long sentence can't drag it up over
