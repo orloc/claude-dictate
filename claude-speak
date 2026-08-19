@@ -66,6 +66,29 @@ sink_for_source() {
 SINK="${SPEAK_SINK:-}"
 [[ -n "$SINK" ]] || SINK=$(sink_for_source "$(recorder_target)")
 
+play() { # blocks until the clip finishes — that's what serializes chunks
+    # A pinned sink is a preference, not a requirement: if the headset is off
+    # its node is gone, and falling through to the default device is better
+    # than silence.
+    if [[ -n "$SINK" ]]; then
+        command -v pw-play >/dev/null &&
+            pw-play --target "$SINK" "$1" 2>/dev/null && return
+        command -v paplay >/dev/null &&
+            paplay --device="$SINK" "$1" 2>/dev/null && return
+    fi
+    if command -v paplay >/dev/null; then paplay "$1" 2>/dev/null
+    elif command -v aplay >/dev/null; then aplay -q "$1" 2>/dev/null
+    else ffplay -nodisp -autoexit -loglevel quiet "$1" 2>/dev/null
+    fi
+}
+
+# Play an arbitrary wav through the resolved sink — claude-listen's state tones
+# ride this so device selection lives in exactly one place.
+if [[ "${1:-}" == "--play" ]]; then
+    [[ -f "${2:-}" ]] && play "$2"
+    exit 0
+fi
+
 # --- stop -------------------------------------------------------------------
 
 # Kill the whole detached process group, so an in-flight sherpa or player dies
@@ -205,22 +228,6 @@ synth() { # synth(text, out.wav)
         --num-threads=4 \
         --output-filename="$2" \
         "$1" >/dev/null 2>&1
-}
-
-play() { # blocks until the clip finishes — that's what serializes chunks
-    # A pinned sink is a preference, not a requirement: if the headset is off
-    # its node is gone, and falling through to the default device is better
-    # than silence.
-    if [[ -n "$SINK" ]]; then
-        command -v pw-play >/dev/null &&
-            pw-play --target "$SINK" "$1" 2>/dev/null && return
-        command -v paplay >/dev/null &&
-            paplay --device="$SINK" "$1" 2>/dev/null && return
-    fi
-    if command -v paplay >/dev/null; then paplay "$1" 2>/dev/null
-    elif command -v aplay >/dev/null; then aplay -q "$1" 2>/dev/null
-    else ffplay -nodisp -autoexit -loglevel quiet "$1" 2>/dev/null
-    fi
 }
 
 # Synthesize chunk 0, then keep one chunk in flight ahead of the speaker: while

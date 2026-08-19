@@ -46,6 +46,9 @@ git clone https://github.com/orloc/claude-dictate
 ln -s "$PWD/claude-dictate/claude-dictate" ~/.local/bin/claude-dictate
 ```
 
+Voice output (`claude-speak`) and hands-free control (`claude-listen`) are
+optional additions on top; see their sections below.
+
 Build [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (the CUDA build
 if you have an nvidia card — see quirks below) and download a model,
 e.g. `small.en`.
@@ -149,10 +152,57 @@ Two details worth knowing:
 [sherpa]: https://github.com/k2-fsa/sherpa-onnx
 [99dps]: https://github.com/orloc/99dps
 
+## Hands free
+
+`claude-listen` drops the hotkey entirely. The mic is always open, but nothing
+reaches Claude until you key up — a radio channel, not a dictaphone:
+
+```
+"skylark, come in"            open the mic
+ ...say your thing...
+"... skylark, out"            send it
+"... skylark, disregard"      throw it away
+"skylark, silence"            stop a reply being read aloud
+"skylark, radio check"        hear the current state
+"skylark, help"               hear the protocol, spoken
+```
+
+Run it with `claude-listen` (it prints what it hears to stderr, so a terminal
+or a systemd user unit both work).
+
+**Why it doesn't misfire.** Safety comes from *position*, not from picking a
+rare word — any word you choose you will eventually say. A standalone command
+must be the **entire** utterance, so "then skylark comes in later" can't fire
+it, and the closing commands must be the **final** words of a transmission,
+with the callsign attached, so "move the loop out" doesn't send. That also
+means there's no escape hatch to learn: you can talk about the commands as
+much as you like. The test suite is mostly these near-misses.
+
+Two structural consequences worth knowing. While the mic is open **everything
+is dictation** — "skylark, help" mid-transmission is typed, not run, because
+inside a transmission only the closing commands exist. And a transmission you
+forget to close sends itself after `LISTEN_MAX_TX` rather than being lost.
+
+**Feedback is tonal, not spoken** — rising two-tone for open, falling for
+close, a descending triple for discard, a low buzz for a command that made no
+sense. You hear these constantly and you're not looking at the screen, so
+words would wear out fast.
+
+Speech is found by energy against a *rolling* estimate of the noise floor
+rather than a fixed threshold, since mic gain and room noise move around; the
+floor only learns from quiet frames, so a long sentence can't drag it up over
+itself. `LISTEN_MARGIN_DB` and `LISTEN_CLOSE_MS` are the knobs if it clips your
+first word or splits sentences at pauses.
+
+The honest caveat: this means something is always listening on your mic.
+Everything stays on the machine — whisper is local and nothing is transmitted
+unless it's a command or a dictated message — but "always on" is a real change
+from a hotkey, and worth deciding deliberately rather than by default.
+
 ## Config
 
-All env vars, or set them in `~/.config/claude-dictate/config` (both scripts
-read the same file):
+All env vars, or set them in `~/.config/claude-dictate/config` (all three
+scripts read the same file):
 
 | var | default | what |
 |---|---|---|
@@ -168,6 +218,11 @@ read the same file):
 | `SPEAK_LENGTH_SCALE` | `0.85` | larger is slower; below ~0.8 gets mushy |
 | `SPEAK_MAX_CHARS` | `1200` | cap before the reply is truncated |
 | `SPEAK_SINK` | the mic's card | output sink to play through |
+| `LISTEN_CALLSIGN` | `skylark` | the callsign every command carries |
+| `LISTEN_ALIASES` | `sky lark;skylar;sky clark` | `;`-separated spellings whisper might produce instead |
+| `LISTEN_MAX_TX` | `90` | seconds before an unclosed transmission sends itself |
+| `LISTEN_MARGIN_DB` | `12` | dB above the noise floor that counts as speech |
+| `LISTEN_CLOSE_MS` | `700` | silence that ends an utterance |
 
 ## Notes / quirks
 
@@ -206,6 +261,12 @@ private socket.
 `./tests/run-speak-tests.sh` — same style for the speech side. A fake sherpa
 CLI logs the text it was asked to synthesize, so the assertions are about what
 would actually be spoken rather than about the cleaning regexes in isolation.
+
+`./tests/run-listen-tests.sh` — grammar and state machine. It sources the
+script and replaces every side effect, so a whole session can be driven with
+no microphone, and so the tests can assert what was *not* done: that ordinary
+speech never dictates, that near-miss sentences never fire a command, and that
+help never reaches the dictation path.
 
 ## License
 

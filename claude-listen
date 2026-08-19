@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# claude-listen — hands-free voice control for a Claude Code session.
+#
+# Replaces the dictate hotkey with a radio-style protocol. The mic is always
+# open, but nothing reaches Claude until you key up:
+#
+#   "<callsign>, come in"          open the mic
+#   ...say your thing...
+#   "... <callsign>, out"          send it
+#   "... <callsign>, disregard"    throw it away
+#   "<callsign>, silence"          stop a reply being read aloud
+#   "<callsign>, radio check"      hear the current state
+#   "<callsign>, help"             hear the protocol
+#
+# The safety of this comes from POSITION, not from picking a rare word — any
+# word you choose you will eventually say. A standalone command must be the
+# *entire* utterance, so "then Skylark comes in" can never fire it, and the
+# closing commands must be the *final* words of a transmission. That also means
+# no escape hatch is needed: you can talk about the commands freely.
+#
+# Config: env vars, or ~/.config/claude-dictate/config (shared with the other
+# two scripts):
+#
+#   LISTEN_CALLSIGN    the callsign          (default: skylark)
+#   LISTEN_ALIASES     ;-separated extra spellings whisper might produce
+#                      (default: "sky lark;skylar;sky clark")
+#   LISTEN_MAX_TX      seconds before an unclosed transmission sends itself
+#                      (default: 90)
+#   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
+#   LISTEN_CLOSE_MS    silence that ends an utterance (700)
+#
+# Reuses DICTATE_WHISPER / DICTATE_MODEL / DICTATE_RECORDER / DICTATE_TARGET.
+set -u
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+fi
+
+WHISPER="${DICTATE_WHISPER:-whisper-cli}"
+MODEL="${DICTATE_MODEL:-}"
+RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
+CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
+ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark}"
+MAX_TX="${LISTEN_MAX_TX:-90}"
+MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
+CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
+
+# Every accepted spelling of the callsign. Aliases exist because whisper will
+# occasionally split or mangle a proper noun; the whole-utterance rule keeps the
+# extra surface from mattering.
+CALLSIGNS=("$CALLSIGN")
+while IFS= read -r -d ';' a; do [[ -n "$a" ]] && CALLSIGNS+=("$a"); done <<<"$ALIASES;"
+
+# Spoken phrase -> action. Kept small and closed on purpose: a large command
+# vocabulary is a large accidental-trigger surface.
+declare -A PROWORDS=(
+    ["come in"]=open
+    ["out"]=close
+    ["disregard"]=cancel
+    ["silence"]=hush
+    ["radio check"]=status
+    ["help"]=help
+)
+# Only these may appear at the end of a real transmission; the rest are
+# standalone-only, which is what keeps them out of dictated prose.
+TERMINAL=(out disregard)
+
+# ------------------------------------------------------------------ grammar --
+
+# Fold a transcript to bare words so punctuation and casing can't affect a
+# match: "Skylark, come in." and "skylark come in" are the same command.
+normalize() {
+    tr '[:upper:]' '[:lower:]' \
+        | sed -E "s/[^a-z0-9 ]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//"
+}
+
+# Echo the action when the WHOLE utterance is callsign + proword. Anything
+# else — a longer sentence that merely contains the phrase — is not a command.
+standalone_command() {
+    local n="$1" cs pw
+    for cs in "${CALLSIGNS[@]}"; do
+        for pw in "${!PROWORDS[@]}"; do
+            [[ "$n" == "$cs $pw" ]] && { printf '%s' "${PROWORDS[$pw]}"; return 0; }
+        done
+    done
+    return 1
+}
+
+# Echo "action<TAB>remainder" when the utterance ENDS with callsign + proword.
+# The closing commands have to live here because they necessarily terminate a
+# transmission that carries content — they can't be standalone.
+terminal_command() {
+    local n="$1" cs pw suffix rest
+    for cs in "${CALLSIGNS[@]}"; do
+        for pw in "${TERMINAL[@]}"; do
+            suffix="$cs $pw"
+            if [[ "$n" == "$suffix" || "$n" == *" $suffix" ]]; then
+                rest="${n%"$suffix"}"
+                rest="${rest% }"
+                printf '%s\t%s' "${PROWORDS[$pw]}" "$rest"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------- audio -
+
+# Short distinct tones rather than spoken confirmations: you hear these dozens
+# of times an hour and you're not looking at the screen.
+make_tones() {
+    [[ -f "$RUN_DIR/tone-open.wav" ]] && return 0
+    mkdir -p "$RUN_DIR"
+    python3 - "$RUN_DIR" <<'PY'
+import math, struct, sys, wave
+RATE = 16000
+def tone(path, steps):
+    frames = bytearray()
+    for freq, ms, amp in steps:
+        n = RATE * ms // 1000
+        for i in range(n):
+            # taper the edges so the tone doesn't click
+            env = min(1.0, i / (RATE * 0.008), (n - i) / (RATE * 0.008))
+            v = int(amp * env * 32767 * math.sin(2 * math.pi * freq * i / RATE))
+            frames += struct.pack("<h", v)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+        w.writeframes(bytes(frames))
+d = sys.argv[1]
+tone(f"{d}/tone-open.wav",  [(660, 70, .35), (990, 90, .35)])
+tone(f"{d}/tone-close.wav", [(990, 70, .35), (660, 90, .35)])
+tone(f"{d}/tone-ack.wav",   [(880, 60, .30)])
+tone(f"{d}/tone-abort.wav", [(660, 60, .30), (520, 60, .30), (390, 90, .30)])
+tone(f"{d}/tone-err.wav",   [(200, 180, .30)])
+PY
+}
+
+tone() { "$HERE/claude-speak" --play "$RUN_DIR/tone-$1.wav" 2>/dev/null & }
+speak() { printf '%s' "$1" | "$HERE/claude-speak"; }
+
+help_text() {
+    local c="$CALLSIGN"
+    printf '%s' "Radio protocol. \
+To open the mic, say $c, come in. Then talk normally. \
+To send what you said, finish with $c, out. \
+To throw it away instead, finish with $c, disregard. \
+While the mic is closed you can also say $c, silence, to stop me talking. \
+$c, radio check, to hear the current state. \
+Or $c, help, to hear this again. \
+A command only counts when it is the whole thing you said, so you can talk \
+about these words without setting them off."
+}
+
+# ---------------------------------------------------------------------- run --
+
+STATE=standby
+BUFFER=""
+TX_START=0
+
+log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
+
+transcribe() {
+    "$WHISPER" -m "$MODEL" -f "$1" --no-prints --no-timestamps --suppress-nst \
+        2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+send_buffer() {
+    local text="$1"
+    [[ -n "$text" ]] || { tone err; return 0; }
+    "$HERE/claude-dictate" --send "$text" && log "sent: $text"
+}
+
+handle() {
+    local wav="$1" text norm act out rest
+    text=$(transcribe "$wav")
+    rm -f "$wav"
+    norm=$(normalize <<<"$text")
+    [[ -n "$norm" ]] || return 0
+
+    if [[ "$STATE" == standby ]]; then
+        # In standby nothing is dictation — an utterance is either a command
+        # or it is ignored outright.
+        act=$(standalone_command "$norm") || { log "ignored: $norm"; return 0; }
+        case "$act" in
+            open)   STATE=transmitting; BUFFER=""; TX_START=$SECONDS
+                    tone open; log "mic open" ;;
+            hush)   "$HERE/claude-speak" --stop; tone ack ;;
+            status) speak "Standing by." ;;
+            help)   speak "$(help_text)" ;;
+            close|cancel) tone err; log "close command with mic already shut" ;;
+        esac
+        return 0
+    fi
+
+    if out=$(terminal_command "$norm"); then
+        act="${out%%$'\t'*}"
+        rest="${out#*$'\t'}"
+        case "$act" in
+            close)  [[ -n "$rest" ]] && BUFFER="${BUFFER:+$BUFFER }$rest"
+                    STATE=standby; tone close
+                    send_buffer "$BUFFER"; BUFFER="" ;;
+            cancel) STATE=standby; BUFFER=""; tone abort; log "discarded" ;;
+        esac
+        return 0
+    fi
+
+    BUFFER="${BUFFER:+$BUFFER }$text"
+    log "buffered: $text"
+}
+
+# A missed "out" would otherwise hold the channel open forever, so a long
+# transmission closes and sends itself rather than being lost.
+check_timeout() {
+    [[ "$STATE" == transmitting ]] || return 0
+    (( SECONDS - TX_START < MAX_TX )) && return 0
+    log "max transmission reached — sending"
+    STATE=standby; tone close
+    send_buffer "$BUFFER"; BUFFER=""
+}
+
+main() {
+    command -v "$WHISPER" >/dev/null || { echo "whisper-cli not found" >&2; exit 1; }
+    [[ -f "$MODEL" ]] || { echo "model not found — set DICTATE_MODEL" >&2; exit 1; }
+    command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
+
+    rm -rf "$RUN_DIR"; mkdir -p "$RUN_DIR"
+    make_tones
+    log "listening — say \"$CALLSIGN, come in\" to key up (\"$CALLSIGN, help\" for the protocol)"
+    tone ack
+
+    # The segmenter's stdout becomes fd 3: one utterance path per line. The
+    # RUN_DIR in its argv is unique per run, so cleanup can target exactly this
+    # segmenter; the recorder then dies of SIGPIPE when the segmenter goes.
+    # $RECORDER is a word-split command by design (same contract as
+    # claude-dictate); "-" makes pw-record stream to stdout.
+    exec 3< <($RECORDER - 2>/dev/null \
+        | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
+              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS")
+    trap 'pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null;
+          pkill -P $$ 2>/dev/null; rm -rf "$RUN_DIR"' EXIT
+
+    # Read utterances as they close, with a periodic tick so the transmission
+    # timeout still fires while nobody is saying anything.
+    local wav st
+    while true; do
+        if read -r -t 5 wav <&3; then
+            [[ -f "$wav" ]] && handle "$wav"
+        else
+            st=$?
+            (( st > 128 )) || break     # not a timeout: the stream ended
+            check_timeout
+        fi
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

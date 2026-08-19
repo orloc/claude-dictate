@@ -118,6 +118,15 @@ stop_and_send() {
         return 0
     fi
 
+    inject "$text"
+    notify normal 4000 "➜ $text"
+}
+
+# inject TEXT — type TEXT into the target session and submit it. Also reachable
+# as `claude-dictate --send TEXT` so claude-listen can put a voice-assembled
+# transmission through the same path rather than reimplementing these quirks.
+inject() {
+    local text="$1"
     tmux has-session -t "=$TARGET" 2>/dev/null \
         || die "no tmux session '$TARGET' — start one with: tmux new -s $TARGET claude"
 
@@ -131,10 +140,16 @@ stop_and_send() {
     # against a live session: chained never submits, a ~0.4s gap always does.
     sleep "$SUBMIT_DELAY"
     tmux send-keys -t "=$TARGET:" Enter || die "tmux send-keys failed"
-    notify normal 4000 "➜ $text"
 }
 
 main() {
+    if [[ "${1:-}" == "--send" ]]; then
+        shift
+        [[ -n "${1:-}" ]] || exit 0
+        inject "$*"
+        exit 0
+    fi
+
     command -v "$WHISPER" >/dev/null || die "whisper-cli not found — set DICTATE_WHISPER in $CONFIG_FILE"
     [[ -f "$MODEL" ]] || die "model not found — set DICTATE_MODEL in $CONFIG_FILE"
     mkdir -p "$RUN_DIR"
@@ -151,5 +166,5 @@ main() {
 
 # Run main unless we're being sourced (e.g. by the tests).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main
+    main "$@"
 fi
