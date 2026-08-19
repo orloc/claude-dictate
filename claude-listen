@@ -23,7 +23,8 @@
 #
 #   LISTEN_CALLSIGN    the callsign          (default: skylark)
 #   LISTEN_ALIASES     ;-separated extra spellings whisper might produce
-#                      (default: "sky lark;skylar;sky clark")
+#                      (default covers what whisper has actually produced
+#                      for "skylark", including "Scarlett")
 #   LISTEN_MAX_TX      seconds before an unclosed transmission sends itself
 #                      (default: 90)
 #   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
@@ -36,6 +37,7 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen"
 TONE_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/tones"
 PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.pid"
+LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.log"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -47,7 +49,7 @@ MODEL="${DICTATE_MODEL:-}"
 RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
 TARGET="${DICTATE_TARGET:-claude}"
 CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
-ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark}"
+ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark;scarlett;scarlet;skylarke;sky lock;skylab;sly lark}"
 MAX_TX="${LISTEN_MAX_TX:-90}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
@@ -190,6 +192,9 @@ handle() {
     text=$(transcribe "$wav")
     rm -f "$wav"
     norm=$(normalize <<<"$text")
+    # Log before the empty check: "whisper returned nothing" is exactly the
+    # case you need to see when the thing appears to ignore you.
+    log "heard [$STATE]: \"$text\" -> \"$norm\""
     [[ -n "$norm" ]] || return 0
 
     if [[ "$STATE" == standby ]]; then
@@ -275,7 +280,8 @@ start_listener() {
     fi
     mkdir -p "$(dirname "$PIDFILE")"
     make_tones
-    setsid --fork "$0" --run >/dev/null 2>&1 </dev/null
+    : > "$LOGFILE"
+    setsid --fork "$0" --run >>"$LOGFILE" 2>&1 </dev/null
     tone on
     notify low 4000 "listening — say \"$CALLSIGN, come in\""
 }
@@ -303,6 +309,18 @@ cleanup() {
     return 0
 }
 
+open_stream() {
+    exec 3< <($RECORDER - 2>/dev/null \
+        | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
+              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS")
+}
+
+close_stream() {
+    exec 3<&-
+    pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
+    return 0
+}
+
 run_listener() {
     command -v "$WHISPER" >/dev/null || { echo "whisper-cli not found" >&2; exit 1; }
     [[ -f "$MODEL" ]] || { echo "model not found — set DICTATE_MODEL" >&2; exit 1; }
@@ -323,9 +341,7 @@ run_listener() {
     # segmenter; the recorder then dies of SIGPIPE when the segmenter goes.
     # $RECORDER is a word-split command by design (same contract as
     # claude-dictate); "-" makes pw-record stream to stdout.
-    exec 3< <($RECORDER - 2>/dev/null \
-        | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
-              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS")
+    open_stream
 
     # Read utterances as they close, with a periodic tick so the transmission
     # timeout still fires while nobody is saying anything.
@@ -335,8 +351,17 @@ run_listener() {
             [[ -f "$wav" ]] && handle "$wav"
         else
             st=$?
-            (( st > 128 )) || break     # not a timeout: the stream ended
-            check_timeout
+            if (( st > 128 )); then
+                check_timeout
+            else
+                # The capture stream ended — headset asleep, device
+                # reconfigured, recorder killed. Rebuild rather than exit: a
+                # listener that quits silently looks identical to a broken one.
+                log "capture stream ended — restarting it"
+                close_stream
+                sleep 1
+                open_stream
+            fi
         fi
     done
 }
@@ -349,6 +374,7 @@ usage: claude-listen [--toggle|--start|--stop|--status|--run]
   --start    start listening in the background
   --stop     stop the background listener
   --status   report whether the listener is running
+  --log      follow the listener's log (what it heard, and how it read it)
   --run      run in the foreground, logging to stderr (default with no args)
 EOF
     exit 2
@@ -360,6 +386,7 @@ main() {
         --start)  start_listener ;;
         --stop)   stop_listener ;;
         --status) status_listener ;;
+        --log)    tail -n "${2:-40}" -f "$LOGFILE" ;;
         --run|"") run_listener ;;
         *)        usage ;;
     esac
