@@ -167,8 +167,30 @@ reaches Claude until you key up — a radio channel, not a dictaphone:
 "skylark, help"               hear the protocol, spoken
 ```
 
-Run it with `claude-listen` (it prints what it hears to stderr, so a terminal
-or a systemd user unit both work).
+**Turning it on and off.** The listener is a background process you toggle,
+not something that runs forever:
+
+```sh
+claude-listen --toggle    # on, or off if already on — bind this to a key
+claude-listen --start     # on
+claude-listen --stop      # off
+claude-listen --status    # which is it
+claude-listen             # foreground, logging to stderr (for debugging)
+```
+
+Toggling is deliberately the primary verb, because the thing you want bound to
+a key is "start listening / stop listening" — a rising three-tone says it's
+live, a falling three-tone says it's off, so you know without looking. Under
+awesome:
+
+```lua
+awful.key({ modkey, "Shift" }, "d", function()
+    awful.spawn(os.getenv("HOME") .. "/.local/bin/claude-listen --toggle")
+end, { description = "toggle claude voice listener", group = "hotkeys" }),
+```
+
+That leaves the plain `claude-dictate` hotkey alone, so push-to-talk stays
+available for when you'd rather not have an open mic.
 
 **Why it doesn't misfire.** Safety comes from *position*, not from picking a
 rare word — any word you choose you will eventually say. A standalone command

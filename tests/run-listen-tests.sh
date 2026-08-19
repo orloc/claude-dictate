@@ -143,6 +143,29 @@ check_timeout
 eq "timeout closes the mic"  "$STATE" "standby"
 eq "timeout sends the buffer" "$SENT" "a long thought"
 
+# --- listener liveness ------------------------------------------------------
+# A pidfile is a claim, not proof: a crashed listener leaves one behind, and a
+# recycled pid would otherwise make --toggle try to stop a stranger's process.
+echo "# listener liveness"
+mkdir -p "$(dirname "$PIDFILE")"
+
+rm -f "$PIDFILE"
+listener_pid >/dev/null && no "no pidfile means not running" || ok "no pidfile means not running"
+
+echo "not-a-pid" > "$PIDFILE"
+listener_pid >/dev/null && no "garbage pidfile means not running" || ok "garbage pidfile means not running"
+
+# a pid that has certainly exited
+sleep 0 & dead=$!; wait "$dead" 2>/dev/null
+echo "$dead" > "$PIDFILE"
+listener_pid >/dev/null && no "dead pid means not running" || ok "dead pid means not running"
+
+sleep 30 & live=$!
+echo "$live" > "$PIDFILE"
+eq "a live pid is reported" "$(listener_pid)" "$live"
+kill "$live" 2>/dev/null
+rm -f "$PIDFILE"
+
 echo
 echo "passed: $pass  failed: $fail"
 [[ $fail -eq 0 ]]

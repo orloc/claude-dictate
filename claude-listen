@@ -34,6 +34,8 @@ set -u
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen"
+TONE_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/tones"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.pid"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -114,9 +116,9 @@ terminal_command() {
 # Short distinct tones rather than spoken confirmations: you hear these dozens
 # of times an hour and you're not looking at the screen.
 make_tones() {
-    [[ -f "$RUN_DIR/tone-open.wav" ]] && return 0
-    mkdir -p "$RUN_DIR"
-    python3 - "$RUN_DIR" <<'PY'
+    [[ -f "$TONE_DIR/tone-open.wav" ]] && return 0
+    mkdir -p "$TONE_DIR"
+    python3 - "$TONE_DIR" <<'PY'
 import math, struct, sys, wave
 RATE = 16000
 def tone(path, steps):
@@ -137,10 +139,12 @@ tone(f"{d}/tone-close.wav", [(990, 70, .35), (660, 90, .35)])
 tone(f"{d}/tone-ack.wav",   [(880, 60, .30)])
 tone(f"{d}/tone-abort.wav", [(660, 60, .30), (520, 60, .30), (390, 90, .30)])
 tone(f"{d}/tone-err.wav",   [(200, 180, .30)])
+tone(f"{d}/tone-on.wav",    [(520, 60, .30), (660, 60, .30), (880, 90, .30)])
+tone(f"{d}/tone-off.wav",   [(880, 60, .30), (660, 60, .30), (440, 110, .30)])
 PY
 }
 
-tone() { "$HERE/claude-speak" --play "$RUN_DIR/tone-$1.wav" 2>/dev/null & }
+tone() { "$HERE/claude-speak" --play "$TONE_DIR/tone-$1.wav" 2>/dev/null & }
 speak() { printf '%s' "$1" | "$HERE/claude-speak"; }
 
 help_text() {
@@ -223,15 +227,72 @@ check_timeout() {
     send_buffer "$BUFFER"; BUFFER=""
 }
 
-main() {
+# ------------------------------------------------------------------ control --
+
+notify() {
+    command -v notify-send >/dev/null && notify-send -u low -t "$1" "claude-listen" "$2"
+    return 0
+}
+
+# Echo the running listener's pid, or fail. A pidfile left behind by a crash
+# names nothing, so liveness is checked rather than assumed.
+listener_pid() {
+    local p
+    p=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    printf '%s' "$p"
+}
+
+start_listener() {
+    if listener_pid >/dev/null; then
+        notify 2000 "already listening"
+        return 0
+    fi
+    mkdir -p "$(dirname "$PIDFILE")"
+    make_tones
+    setsid --fork "$0" --run >/dev/null 2>&1 </dev/null
+    tone on
+    notify 3000 "listening — say \"$CALLSIGN, come in\""
+}
+
+stop_listener() {
+    local p
+    p=$(listener_pid) || { notify 2000 "not listening"; return 0; }
+    kill -TERM "$p" 2>/dev/null
+    tone off
+    notify 3000 "stopped listening"
+}
+
+status_listener() {
+    local p
+    if p=$(listener_pid); then echo "listening (pid $p)"; else echo "not listening"; fi
+}
+
+# ---------------------------------------------------------------------- main --
+
+cleanup() {
+    pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
+    pkill -P $$ 2>/dev/null
+    rm -rf "$RUN_DIR"
+    [[ "$(cat "$PIDFILE" 2>/dev/null)" == "$$" ]] && rm -f "$PIDFILE"
+    return 0
+}
+
+run_listener() {
     command -v "$WHISPER" >/dev/null || { echo "whisper-cli not found" >&2; exit 1; }
     [[ -f "$MODEL" ]] || { echo "model not found — set DICTATE_MODEL" >&2; exit 1; }
     command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
 
-    rm -rf "$RUN_DIR"; mkdir -p "$RUN_DIR"
+    rm -rf "$RUN_DIR"; mkdir -p "$RUN_DIR" "$(dirname "$PIDFILE")"
+    echo $$ > "$PIDFILE"
     make_tones
     log "listening — say \"$CALLSIGN, come in\" to key up (\"$CALLSIGN, help\" for the protocol)"
-    tone ack
+
+    # SIGTERM is how --stop arrives, and bash won't run an EXIT trap for it
+    # unless the signal is trapped too — otherwise the segmenter outlives us.
+    trap 'cleanup; exit 0' TERM INT
+    trap cleanup EXIT
 
     # The segmenter's stdout becomes fd 3: one utterance path per line. The
     # RUN_DIR in its argv is unique per run, so cleanup can target exactly this
@@ -241,8 +302,6 @@ main() {
     exec 3< <($RECORDER - 2>/dev/null \
         | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
               --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS")
-    trap 'pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null;
-          pkill -P $$ 2>/dev/null; rm -rf "$RUN_DIR"' EXIT
 
     # Read utterances as they close, with a periodic tick so the transmission
     # timeout still fires while nobody is saying anything.
@@ -256,6 +315,30 @@ main() {
             check_timeout
         fi
     done
+}
+
+usage() {
+    cat >&2 <<EOF
+usage: claude-listen [--toggle|--start|--stop|--status|--run]
+
+  --toggle   start listening, or stop if already listening (bind this to a key)
+  --start    start listening in the background
+  --stop     stop the background listener
+  --status   report whether the listener is running
+  --run      run in the foreground, logging to stderr (default with no args)
+EOF
+    exit 2
+}
+
+main() {
+    case "${1:-}" in
+        --toggle) if listener_pid >/dev/null; then stop_listener; else start_listener; fi ;;
+        --start)  start_listener ;;
+        --stop)   stop_listener ;;
+        --status) status_listener ;;
+        --run|"") run_listener ;;
+        *)        usage ;;
+    esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
