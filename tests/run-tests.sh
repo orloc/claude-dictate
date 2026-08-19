@@ -305,6 +305,29 @@ kill "$BYSTANDER" 2>/dev/null
 sleep 0.5
 assert_eq "stale pidfile: nothing injected" "" "$(cat "$OUT")"
 
+# --- the Enter is a separate, delayed keystroke ------------------------------
+# Chained onto the text in one tmux command, the newline is swallowed by the
+# TUI still ingesting the transcript and the message never submits. The gap is
+# the fix, so assert the script actually waits before sending Enter.
+: > "$OUT"
+rm -f "$PIDFILE"
+run_dictate                                   # start
+wait_for_wav || fail "recorder wrote wav (setup)"
+start_ns=$(date +%s%N)
+run_dictate DICTATE_SUBMIT_DELAY=2 FAKE_WHISPER_TEXT='submit delay check'
+elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+if (( elapsed_ms >= 2000 )); then
+    pass "submit delay is honored before Enter"
+else
+    fail "submit delay is honored before Enter" "returned in ${elapsed_ms}ms, expected >=2000ms"
+fi
+if wait_for_out; then
+    assert_eq "delayed submit still injects the transcript" \
+        "submit delay check" "$(cat "$OUT")"
+else
+    fail "delayed submit still injects the transcript (nothing arrived)"
+fi
+
 # ---------------------------------------------------------------- summary ---
 echo
 echo "passed: $PASS  failed: $FAIL"
