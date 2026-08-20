@@ -38,6 +38,7 @@ RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen"
 TONE_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/tones"
 PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.pid"
 LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.log"
+LISTEN_LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.lock"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -310,9 +311,13 @@ cleanup() {
 }
 
 open_stream() {
-    exec 3< <($RECORDER - 2>/dev/null \
+    # 8>&- matters: the singleton lock is fd 8, and a child that inherits it
+    # keeps the lock held after the listener dies — a recorder lingering for
+    # even a few seconds would make an immediate restart claim "already
+    # running" against a corpse.
+    exec 3< <($RECORDER - 2>/dev/null 8>&- \
         | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
-              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS")
+              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS" 8>&-)
 }
 
 close_stream() {
@@ -325,6 +330,21 @@ run_listener() {
     command -v "$WHISPER" >/dev/null || { echo "whisper-cli not found" >&2; exit 1; }
     [[ -f "$MODEL" ]] || { echo "model not found — set DICTATE_MODEL" >&2; exit 1; }
     command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
+    command -v "${RECORDER%% *}" >/dev/null \
+        || { echo "recorder not found: ${RECORDER%% *} — set DICTATE_RECORDER" >&2; exit 1; }
+
+    # Exactly one listener, enforced by a lock rather than a pidfile check: two
+    # instances share the mic, the fixed RUN_DIR, and the pkill pattern, so the
+    # second double-sends every utterance and either one's cleanup destroys the
+    # other. The lock is held for life; a double --toggle's racing children
+    # settle here (the loser exits before touching anything shared), and a
+    # foreground --run beside a background listener is refused the same way.
+    mkdir -p "$(dirname "$LISTEN_LOCK")"
+    exec 8>>"$LISTEN_LOCK"
+    if ! flock -n 8; then
+        echo "another listener is already running" >&2
+        exit 1
+    fi
 
     rm -rf "$RUN_DIR"; mkdir -p "$RUN_DIR" "$(dirname "$PIDFILE")"
     echo $$ > "$PIDFILE"
@@ -336,12 +356,13 @@ run_listener() {
     trap 'cleanup; exit 0' TERM INT
     trap cleanup EXIT
 
-    # The segmenter's stdout becomes fd 3: one utterance path per line. The
-    # RUN_DIR in its argv is unique per run, so cleanup can target exactly this
-    # segmenter; the recorder then dies of SIGPIPE when the segmenter goes.
+    # The segmenter's stdout becomes fd 3: one utterance path per line. Only
+    # one listener can exist (the lock above), so the pkill in cleanup targets
+    # our segmenter alone; the recorder then dies of SIGPIPE when it goes.
     # $RECORDER is a word-split command by design (same contract as
     # claude-dictate); "-" makes pw-record stream to stdout.
     open_stream
+    local stream_up=$SECONDS backoff=1
 
     # Read utterances as they close, with a periodic tick so the transmission
     # timeout still fires while nobody is saying anything.
@@ -357,10 +378,21 @@ run_listener() {
                 # The capture stream ended — headset asleep, device
                 # reconfigured, recorder killed. Rebuild rather than exit: a
                 # listener that quits silently looks identical to a broken one.
-                log "capture stream ended — restarting it"
+                # But a stream that dies IMMEDIATELY (mic unplugged for the
+                # evening) must not become a 1 Hz respawn loop, so quick
+                # deaths back off toward a minute between attempts.
+                if (( SECONDS - stream_up >= 10 )); then
+                    backoff=1
+                    log "capture stream ended — restarting it"
+                else
+                    backoff=$(( backoff * 2 )); (( backoff > 60 )) && backoff=60
+                    log "capture stream died within 10s — retrying in ${backoff}s"
+                    (( backoff == 60 )) && notify critical 5000 "mic unavailable — still retrying"
+                fi
                 close_stream
-                sleep 1
+                sleep "$backoff"
                 open_stream
+                stream_up=$SECONDS
             fi
         fi
     done

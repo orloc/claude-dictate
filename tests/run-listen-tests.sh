@@ -14,7 +14,9 @@ SCRIPT="$TESTS_DIR/../claude-listen"
 [[ -f "$SCRIPT" ]] || { echo "script under test not found: $SCRIPT" >&2; exit 2; }
 
 SANDBOX="$(mktemp -d)"
-trap 'rm -rf "$SANDBOX"' EXIT
+# A real recorder dies of SIGPIPE when its segmenter goes; the fake one never
+# writes, so it must be reaped by path or it lingers for its full sleep.
+trap 'pkill -f "$SANDBOX" 2>/dev/null; rm -rf "$SANDBOX"' EXIT
 
 # Keep the user's real config out of the run; the defaults are what we assert.
 export XDG_CONFIG_HOME="$SANDBOX/config"
@@ -189,6 +191,67 @@ echo "$live" > "$PIDFILE"
 eq "a live pid is reported" "$(listener_pid)" "$live"
 kill "$live" 2>/dev/null
 rm -f "$PIDFILE"
+
+# --- singleton ----------------------------------------------------------------
+# Two live listeners share the mic and each cleanup destroys the other, so a
+# second --run must be refused while the first holds the lock. Driven with a
+# real background instance on fake binaries — no mic, whisper, or tmux needed.
+echo "# singleton"
+FB="$SANDBOX/bin"; mkdir -p "$FB"
+printf '#!/bin/sh\nexit 0\n' > "$FB/fake-whisper"
+# Streams like the real recorder, so it dies of SIGPIPE when its segmenter is
+# killed instead of lingering as an orphan the suite has to hunt down.
+printf '#!/bin/sh\nexec cat /dev/zero\n' > "$FB/fake-recorder"
+printf '#!/bin/sh\nexit 0\n' > "$FB/notify-send"
+chmod +x "$FB"/*
+: > "$SANDBOX/model.bin"
+
+run_bg_listener() {
+    env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+        DICTATE_WHISPER="$FB/fake-whisper" DICTATE_MODEL="$SANDBOX/model.bin" \
+        DICTATE_RECORDER="$FB/fake-recorder" \
+        bash "$SCRIPT" --run
+}
+
+run_bg_listener >/dev/null 2>&1 &
+first=$!
+sleep 2
+if kill -0 "$first" 2>/dev/null; then ok "first listener is running"
+else no "first listener is running"; fi
+
+second_out=$(run_bg_listener 2>&1); second_st=$?
+eq "a second listener is refused"      "$second_st" "1"
+if grep -q "already running" <<<"$second_out"; then ok "the refusal says why"
+else no "the refusal says why" "got: $second_out"; fi
+
+if kill -0 "$first" 2>/dev/null; then ok "the refusal does not damage the running one"
+else no "the refusal does not damage the running one"; fi
+
+# $first is the wrapper subshell; the listener's own pid is in its pidfile.
+lpid=$(cat "$XDG_RUNTIME_DIR/claude-dictate/listen.pid" 2>/dev/null)
+[[ -n "$lpid" ]] && kill -TERM "$lpid" 2>/dev/null
+kill -TERM "$first" 2>/dev/null; wait "$first" 2>/dev/null
+sleep 1
+third_out=$(timeout 3 bash -c '
+    env -i PATH="'"$FB"':/usr/bin:/bin" HOME="'"$SANDBOX"'" \
+        XDG_RUNTIME_DIR="'"$XDG_RUNTIME_DIR"'" XDG_CONFIG_HOME="'"$XDG_CONFIG_HOME"'" \
+        DICTATE_WHISPER="'"$FB/fake-whisper"'" DICTATE_MODEL="'"$SANDBOX/model.bin"'" \
+        DICTATE_RECORDER="'"$FB/fake-recorder"'" \
+        bash "'"$SCRIPT"'" --run 2>&1 & pid=$!
+    sleep 2; kill -TERM $pid 2>/dev/null; wait $pid 2>/dev/null' )
+if grep -q "listening" <<<"$third_out"; then ok "the lock is released when the holder dies"
+else no "the lock is released when the holder dies" "got: $third_out"; fi
+
+# a recorder that isn't installed is refused up front, not respawn-looped
+missing_out=$(env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DICTATE_WHISPER="$FB/fake-whisper" DICTATE_MODEL="$SANDBOX/model.bin" \
+    DICTATE_RECORDER="no-such-recorder --flags" \
+    bash "$SCRIPT" --run 2>&1); missing_st=$?
+eq "a missing recorder is refused at startup" "$missing_st" "1"
+if grep -q "recorder not found" <<<"$missing_out"; then ok "the recorder refusal says why"
+else no "the recorder refusal says why" "got: $missing_out"; fi
 
 echo
 echo "passed: $pass  failed: $fail"

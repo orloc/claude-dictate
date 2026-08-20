@@ -42,6 +42,9 @@ MODEL="${DICTATE_MODEL:-}"
 TARGET="${DICTATE_TARGET:-claude}"
 RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
 SUBMIT_DELAY="${DICTATE_SUBMIT_DELAY:-0.5}"
+# A malformed delay would make `sleep` fail instantly, silently resurrecting
+# the swallowed-Enter bug the delay exists to prevent.
+[[ "$SUBMIT_DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]] || SUBMIT_DELAY=0.5
 
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
 PIDFILE="$RUN_DIR/rec.pid"
@@ -69,8 +72,12 @@ is_hallucination() {
 
 start_recording() {
     # Barge-in: a reply still being read aloud would end up in the recording,
-    # so cut it off before opening the mic.
-    command -v claude-speak >/dev/null && claude-speak --stop
+    # so cut it off before opening the mic. Sibling-resolved, not PATH: hotkey
+    # environments often lack ~/.local/bin, and a silently skipped stop means
+    # the mic records Claude's own voice off the speakers.
+    local here
+    here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+    [[ -x "$here/claude-speak" ]] && "$here/claude-speak" --stop
     rm -f "$WAV"
     $RECORDER "$WAV" &
     local pid=$!
@@ -130,6 +137,13 @@ inject() {
     tmux has-session -t "=$TARGET" 2>/dev/null \
         || die "no tmux session '$TARGET' — start one with: tmux new -s $TARGET claude"
 
+    # Serialize senders: the delay below opens a window where a concurrent
+    # inject (a listener auto-send racing a hotkey dictation) would interleave
+    # its text between ours and our Enter, merging two prompts into one.
+    mkdir -p "$RUN_DIR"
+    exec 8>>"$RUN_DIR/inject.lock"
+    flock -w 30 8 || die "another dictation is mid-send"
+
     # tmux argv parsing eats a trailing unescaped ';' — escape it
     [[ "$text" == *\; ]] && text="${text%;}\\;"
     tmux send-keys -t "=$TARGET:" -l -- "$text" || die "tmux send-keys failed"
@@ -140,6 +154,7 @@ inject() {
     # against a live session: chained never submits, a ~0.4s gap always does.
     sleep "$SUBMIT_DELAY"
     tmux send-keys -t "=$TARGET:" Enter || die "tmux send-keys failed"
+    exec 8>&-
 }
 
 main() {

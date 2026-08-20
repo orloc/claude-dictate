@@ -328,6 +328,35 @@ else
     fail "delayed submit still injects the transcript (nothing arrived)"
 fi
 
+# --- concurrent sends must not interleave ------------------------------------
+# The submit delay opens a window between a sender's text and its Enter; two
+# unserialized senders (a listener auto-send racing a hotkey dictation) would
+# merge their prompts. inject() holds a lock across the gap, so each message
+# must arrive on its own line.
+run_send() { # run_send(text) — the --send entry point, with a wide gap
+    env -i \
+        HOME="$FAKEHOME" \
+        PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+        XDG_CONFIG_HOME="$CONFHOME" \
+        XDG_RUNTIME_DIR="$RUNTIME" \
+        TMUX_TMPDIR="$TMUXDIR" \
+        DICTATE_MODEL="$MODEL_FILE" \
+        DICTATE_TARGET="$SESSION" \
+        DICTATE_RECORDER="$FAKEBIN/fake-recorder" \
+        DICTATE_SUBMIT_DELAY=0.6 \
+        bash "$SCRIPT" --send "$1" 2>/dev/null
+}
+: > "$OUT"
+run_send "alpha message" &
+run_send "bravo message" &
+wait
+sleep 1
+if [[ "$(sort "$OUT")" == $'alpha message\nbravo message' ]]; then
+    pass "concurrent --send calls do not interleave"
+else
+    fail "concurrent --send calls do not interleave" "got: $(tr '\n' '|' < "$OUT")"
+fi
+
 # ---------------------------------------------------------------- summary ---
 echo
 echo "passed: $PASS  failed: $FAIL"
