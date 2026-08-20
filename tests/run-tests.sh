@@ -15,6 +15,10 @@ SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")"
 
 # ---------------------------------------------------------------- sandbox ---
 SANDBOX="$(mktemp -d)"
+# A set TMUX makes every tmux client ignore TMUX_TMPDIR and target the caller's
+# real server — running these tests from inside tmux then kills that server
+# (and whoever is in it) via the cleanup trap's kill-server.
+unset TMUX TMUX_PANE
 FAKEBIN="$SANDBOX/bin"
 RUNTIME="$SANDBOX/runtime"          # becomes XDG_RUNTIME_DIR
 CONFHOME="$SANDBOX/config"          # becomes XDG_CONFIG_HOME (empty: no user config leaks)
@@ -32,7 +36,11 @@ cleanup() {
     if [[ -f "$RUNTIME/claude-dictate/rec.pid" ]]; then
         kill "$(cat "$RUNTIME/claude-dictate/rec.pid")" 2>/dev/null
     fi
-    TMUX_TMPDIR="$TMUXDIR" tmux kill-server 2>/dev/null
+    # kill-server by explicit socket path, never by TMUX_TMPDIR: this tmux
+    # build silently falls back to the REAL default socket when TMUX_TMPDIR
+    # names a directory that no longer exists (killed a host session on
+    # 2026-08-19, incident #2). -S errors out instead of falling back.
+    tmux -S "$TMUXDIR/tmux-$(id -u)/default" kill-server 2>/dev/null
     rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
@@ -356,6 +364,95 @@ if [[ "$(sort "$OUT")" == $'alpha message\nbravo message' ]]; then
 else
     fail "concurrent --send calls do not interleave" "got: $(tr '\n' '|' < "$OUT")"
 fi
+
+# --- --send --to: routing into named instances --------------------------------
+# Two panes and a roster mapping names to them: each send must land in its own
+# pane and nowhere else, and an unrostered name must be refused.
+OUT2="$SANDBOX/tmux-out2.txt"
+PANE1=$(TMUX_TMPDIR="$TMUXDIR" tmux display-message -t "=$SESSION:" -p '#{pane_id}')
+PANE2=$(TMUX_TMPDIR="$TMUXDIR" tmux split-window -d -t "=$SESSION:" -P -F '#{pane_id}' "cat >> $OUT2")
+mkdir -p "$RUNTIME/claude-dictate"
+printf 'alpha\t%s\nbravo\t%s\n' "$PANE1" "$PANE2" > "$RUNTIME/claude-dictate/roster"
+
+run_send_to() { # run_send_to(target, text)
+    env -i \
+        HOME="$FAKEHOME" \
+        PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+        XDG_CONFIG_HOME="$CONFHOME" \
+        XDG_RUNTIME_DIR="$RUNTIME" \
+        TMUX_TMPDIR="$TMUXDIR" \
+        DICTATE_MODEL="$MODEL_FILE" \
+        DICTATE_TARGET="$SESSION" \
+        DICTATE_RECORDER="$FAKEBIN/fake-recorder" \
+        DICTATE_SUBMIT_DELAY=0.2 \
+        bash "$SCRIPT" --send --to "$1" "$2" 2>/dev/null
+}
+
+wait_for_out2() {
+    for _ in $(seq 1 50); do
+        [[ -s "$OUT2" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+: > "$OUT"
+run_send_to bravo "for bravo only"
+assert_status "--to a rostered name exits 0" 0 "$?"
+if wait_for_out2; then
+    assert_eq "--to routes to the named pane" "for bravo only" "$(cat "$OUT2")"
+else
+    fail "--to routes to the named pane (nothing arrived)"
+fi
+sleep 0.3
+assert_eq "--to leaves the other pane untouched" "" "$(cat "$OUT")"
+
+: > "$OUT"
+run_send_to "$PANE1" "by pane id"
+assert_status "--to a raw pane id exits 0" 0 "$?"
+if wait_for_out; then
+    assert_eq "--to accepts a raw pane id" "by pane id" "$(cat "$OUT")"
+else
+    fail "--to accepts a raw pane id (nothing arrived)"
+fi
+
+: > "$OUT"; : > "$OUT2"
+run_send_to charlie "into the void"
+st=$?
+if (( st != 0 )); then
+    pass "--to an unrostered name is refused"
+else
+    fail "--to an unrostered name is refused (exit 0)"
+fi
+sleep 0.3
+assert_eq "the refused send reaches no pane" "" "$(cat "$OUT")$(cat "$OUT2")"
+
+# Per-pane locks: two concurrent sends to DIFFERENT panes must not serialize.
+# Each holds its lock across a 1s submit delay; run in parallel they finish in
+# well under the 2s a shared lock would force (generous bound for slow days).
+: > "$OUT"; : > "$OUT2"
+t0=$(date +%s%N)
+env -i HOME="$FAKEHOME" PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+    XDG_CONFIG_HOME="$CONFHOME" XDG_RUNTIME_DIR="$RUNTIME" TMUX_TMPDIR="$TMUXDIR" \
+    DICTATE_MODEL="$MODEL_FILE" DICTATE_TARGET="$SESSION" \
+    DICTATE_RECORDER="$FAKEBIN/fake-recorder" DICTATE_SUBMIT_DELAY=1 \
+    bash "$SCRIPT" --send --to alpha "to alpha" 2>/dev/null &
+env -i HOME="$FAKEHOME" PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+    XDG_CONFIG_HOME="$CONFHOME" XDG_RUNTIME_DIR="$RUNTIME" TMUX_TMPDIR="$TMUXDIR" \
+    DICTATE_MODEL="$MODEL_FILE" DICTATE_TARGET="$SESSION" \
+    DICTATE_RECORDER="$FAKEBIN/fake-recorder" DICTATE_SUBMIT_DELAY=1 \
+    bash "$SCRIPT" --send --to bravo "to bravo" 2>/dev/null &
+wait
+elapsed_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+if (( elapsed_ms < 1900 )); then
+    pass "sends to different panes run concurrently (${elapsed_ms}ms)"
+else
+    fail "sends to different panes run concurrently (took ${elapsed_ms}ms, a shared lock would take >=2000)"
+fi
+sleep 0.5
+assert_eq "concurrent cross-pane sends both land" "to alpha|to bravo" "$(cat "$OUT")|$(cat "$OUT2")"
+
+rm -f "$RUNTIME/claude-dictate/roster"
 
 # ---------------------------------------------------------------- summary ---
 echo

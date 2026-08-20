@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# claude-roster — named claude instances, each one a pane of the target
+# tmux session.
+#
+# The roster is the substrate the voice layer stands on: claude-listen turns
+# "skylark, spawn" into `claude-roster spawn`, but every subcommand works from
+# a plain shell too, which is how it's tested and how you inspect it when the
+# voice layer is confusing you.
+#
+#   claude-roster spawn              new pane running DICTATE_SPAWN_CMD,
+#                                    named from the pool; bootstraps the
+#                                    session itself when none exists
+#   claude-roster kill NAME          kill the instance's pane
+#   claude-roster list               NAME<TAB>PANE<TAB>focused|-  per line
+#   claude-roster focus NAME         make NAME the audible one
+#   claude-roster rename OLD NEW     retarget to an unused pool name
+#   claude-roster reap               drop entries whose pane is gone
+#   claude-roster pane NAME          resolve NAME to its tmux pane id
+#   claude-roster status             one human line
+#
+# State lives in $XDG_RUNTIME_DIR/claude-dictate:
+#   roster       one "<name>\t<pane_id>" per line
+#   focus-pane   the pane id of the audible instance, alone
+# Pane ids are tmux's stable %N form — window/pane *indexes* renumber when a
+# neighbour closes and must never be stored.
+#
+# Config (env or ~/.config/claude-dictate/config, shared with the others):
+#   DICTATE_TARGET     tmux session holding the panes   (default: claude)
+#   DICTATE_SPAWN_CMD  what a new pane runs             (default: claude)
+#   LISTEN_POOL        names, space-separated
+#                      (default: alpha bravo charlie delta echo foxtrot)
+set -u
+
+die() { echo "claude-roster: $1" >&2; exit 1; }
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null || die "syntax error in $CONFIG_FILE"
+    set +u
+    . "$CONFIG_FILE"
+    set -u
+fi
+
+TARGET="${DICTATE_TARGET:-claude}"
+SPAWN_CMD="${DICTATE_SPAWN_CMD:-claude}"
+POOL="${LISTEN_POOL:-alpha bravo charlie delta echo foxtrot}"
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+ROSTER="$RUN_DIR/roster"
+FOCUS="$RUN_DIR/focus-pane"
+LOCK="$RUN_DIR/roster.lock"
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+
+# ------------------------------------------------------------------ helpers --
+
+roster_lines() { cat "$ROSTER" 2>/dev/null; }
+
+pane_of() { # pane_of(name) — from the roster, no liveness check
+    awk -F'\t' -v n="$1" '$1 == n { print $2; exit }' "$ROSTER" 2>/dev/null | grep .
+}
+
+name_of() { # name_of(pane)
+    awk -F'\t' -v p="$1" '$2 == p { print $1; exit }' "$ROSTER" 2>/dev/null | grep .
+}
+
+focused_pane() { cat "$FOCUS" 2>/dev/null; }
+
+in_pool() { # in_pool(name)
+    local w
+    for w in $POOL; do [[ "$w" == "$1" ]] && return 0; done
+    return 1
+}
+
+write_focus() { # write_focus(pane) — atomic, so the hook never reads a torn file
+    printf '%s' "$1" > "$FOCUS.tmp" && mv "$FOCUS.tmp" "$FOCUS"
+}
+
+# Drop roster entries whose pane no longer exists, and never leave the focus
+# pointing at a corpse: hand-closed panes must not accumulate as ghosts, and a
+# dead focus would silence every surviving instance (the speak hook lets only
+# the focused pane through).
+reap_locked() { # echoes the names it drops
+    local live name pane kept="" dropped="" first_pane=""
+    live=$(tmux list-panes -s -t "=$TARGET" -F '#{pane_id}' 2>/dev/null) || live=""
+    while IFS=$'\t' read -r name pane; do
+        [[ -n "$name" ]] || continue
+        if grep -qxF "$pane" <<<"$live"; then
+            kept="$kept$name	$pane"$'\n'
+            [[ -z "$first_pane" ]] && first_pane="$pane"
+        else
+            dropped="$dropped$name"$'\n'
+        fi
+    done < <(roster_lines)
+    printf '%s' "$kept" > "$ROSTER.tmp" && mv "$ROSTER.tmp" "$ROSTER"
+
+    local f
+    f=$(focused_pane)
+    if [[ -n "$f" ]] && ! grep -qF "	$f" "$ROSTER" 2>/dev/null; then
+        if [[ -n "$first_pane" ]]; then write_focus "$first_pane"; else rm -f "$FOCUS"; fi
+    fi
+    printf '%s' "$dropped"
+}
+
+# ------------------------------------------------------------- subcommands ---
+
+cmd_spawn() {
+    local name="" w pane
+    for w in $POOL; do
+        pane_of "$w" >/dev/null || { name="$w"; break; }
+    done
+    [[ -n "$name" ]] || die "name pool exhausted ($POOL)"
+
+    # $SPAWN_CMD is word-split by design — same contract as DICTATE_RECORDER.
+    # -d: spawning must not move the cursor or the audible focus; only an
+    # explicit `focus` does both.
+    # 9>&- matters: a tmux client that has to auto-start the server hands it
+    # every open fd — including the roster lock on fd 9, which the server
+    # would then hold for its whole life, wedging every later invocation.
+    if tmux has-session -t "=$TARGET" 2>/dev/null 9>&-; then
+        pane=$(tmux split-window -d -t "=$TARGET:" -P -F '#{pane_id}' -- $SPAWN_CMD 9>&-) \
+            || die "tmux split-window failed"
+        tmux select-layout -t "=$TARGET:" tiled 2>/dev/null 9>&-
+    else
+        pane=$(tmux new-session -d -s "$TARGET" -P -F '#{pane_id}' -- $SPAWN_CMD 9>&-) \
+            || die "tmux new-session failed"
+    fi
+
+    printf '%s\t%s\n' "$name" "$pane" >> "$ROSTER"
+    # The first instance must be audible without a separate focus step, or a
+    # fresh roster starts mute.
+    [[ -n "$(focused_pane)" ]] || write_focus "$pane"
+    printf '%s\t%s\n' "$name" "$pane"
+}
+
+cmd_kill() {
+    local name="$1" pane
+    pane=$(pane_of "$name") || die "no instance '$name'"
+    tmux kill-pane -t "$pane" 2>/dev/null
+    grep -v $'^'"$name"$'\t' "$ROSTER" > "$ROSTER.tmp" && mv "$ROSTER.tmp" "$ROSTER"
+    # the pane is gone but the focus fix lives in reap
+    reap_locked >/dev/null
+    printf '%s\t%s\n' "$name" "$pane"
+}
+
+cmd_list() {
+    local name pane f
+    f=$(focused_pane)
+    while IFS=$'\t' read -r name pane; do
+        [[ -n "$name" ]] || continue
+        printf '%s\t%s\t%s\n' "$name" "$pane" "$([[ "$pane" == "$f" ]] && echo focused || echo -)"
+    done < <(roster_lines)
+}
+
+cmd_focus() {
+    local name="$1" pane
+    pane=$(pane_of "$name") || die "no instance '$name'"
+    write_focus "$pane"
+    tmux select-pane -t "$pane" 2>/dev/null
+    # Focus is audibility: whoever was mid-sentence is no longer the one
+    # you're listening to.
+    [[ -x "$HERE/claude-speak" ]] && "$HERE/claude-speak" --stop
+    printf '%s\t%s\n' "$name" "$pane"
+}
+
+cmd_rename() {
+    local old="$1" new="$2" pane
+    pane=$(pane_of "$old") || die "no instance '$old'"
+    in_pool "$new" || die "'$new' is not a pool name ($POOL)"
+    pane_of "$new" >/dev/null && die "'$new' is already in use"
+    { grep -v $'^'"$old"$'\t' "$ROSTER"; printf '%s\t%s\n' "$new" "$pane"; } \
+        > "$ROSTER.tmp" && mv "$ROSTER.tmp" "$ROSTER"
+    printf '%s\t%s\n' "$new" "$pane"
+}
+
+cmd_status() {
+    local n f fname=""
+    n=$(roster_lines | grep -c .)
+    if (( n == 0 )); then echo "no instances"; return 0; fi
+    f=$(focused_pane); [[ -n "$f" ]] && fname=$(name_of "$f")
+    echo "$n up ($(roster_lines | cut -f1 | paste -sd' ')), focused: ${fname:-none}"
+}
+
+usage() {
+    sed -n 's/^#   claude-roster /  /p' "$0" >&2
+    exit 2
+}
+
+main() {
+    local cmd="${1:-}"
+    mkdir -p "$RUN_DIR"
+
+    # One mutator at a time: spawn claims a name before its pane exists, and
+    # two unserialized spawns would claim the same one.
+    exec 9>>"$LOCK"
+    flock -w 10 9 || die "roster is locked"
+
+    # Every subcommand sees a reaped roster, so a hand-closed pane can never
+    # be resolved, listed, or renamed as if it were alive.
+    local reaped
+    reaped=$(reap_locked)
+
+    case "$cmd" in
+        spawn)  cmd_spawn ;;
+        kill)   [[ -n "${2:-}" ]] || usage; cmd_kill "$2" ;;
+        list)   cmd_list ;;
+        focus)  [[ -n "${2:-}" ]] || usage; cmd_focus "$2" ;;
+        rename) [[ -n "${2:-}" && -n "${3:-}" ]] || usage; cmd_rename "$2" "$3" ;;
+        reap)   printf '%s' "$reaped" ;;
+        pane)   [[ -n "${2:-}" ]] || usage; pane_of "$2" || die "no instance '$2'" ;;
+        status) cmd_status ;;
+        *)      usage ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -8,8 +8,10 @@ transcribe them as they arrive.
 Speech is found by energy against a rolling estimate of the room's noise
 floor rather than a fixed threshold: mic gain, headset position and fan noise
 all move the floor, and a fixed number would need retuning every session. The
-floor only tracks downward quickly (a quiet frame is evidence about silence);
-it rises slowly, so a long sentence can't drag the floor up over itself.
+floor tracks downward instantly (a quieter frame is direct evidence about
+silence) and upward slowly on every frame — slowly enough that a sentence
+can't drag the floor up over itself, but steadily enough that a step-up in
+ambient noise is re-learned in seconds instead of holding the mic open.
 
 Hysteresis matters as much as the threshold. Opening needs several consecutive
 loud frames so a keyboard clack can't start an utterance, and closing needs a
@@ -118,11 +120,21 @@ def main():
 
         loud = level > floor + args.margin_db
 
-        # Track the floor only on quiet frames, and only downward fast. Speech
-        # frames must never teach the estimator what silence sounds like.
-        if not loud:
-            floor = min(floor + 0.02, level) if level < floor else floor + 0.02
-            floor = max(floor, -100.0)
+        # The floor drops instantly on a quieter frame, and rises slowly on
+        # EVERY frame — loud ones included. Rising only on quiet frames
+        # deadlocked in the field: a step-up in ambient noise (wireless
+        # headset hiss, a fan) held every frame "loud", so the floor never
+        # got another quiet frame to learn from and the mic stuck open until
+        # max-ms glued a minute of commands into one rejected utterance.
+        # 0.02 dB/frame is 1 dB/s: a noise step re-converges in seconds,
+        # while speech would have to stay continuously loud for over a
+        # margin's worth of seconds to drag the floor over itself — and the
+        # first pause undoes the climb instantly.
+        if level < floor:
+            floor = level
+        else:
+            floor += 0.02
+        floor = max(min(floor, 0.0), -100.0)
 
         if not speaking:
             preroll.append(raw)

@@ -17,26 +17,37 @@
 #
 # Gating comes first and cheapest: a user-level hook fires for EVERY Claude
 # Code session on the machine, and MessageDisplay fires per streaming delta,
-# so the common case has to exit before any real work. Only the session named
-# by DICTATE_TARGET ever speaks or silences.
+# so the common case has to exit before any real work. With a claude-roster
+# focus in effect only the focused pane ever speaks or silences; without one,
+# only the session named by DICTATE_TARGET does.
 set -u
 
-# --- session gate (before anything costs) -------------------------------------
+# --- focus/session gate (before anything costs) --------------------------------
 
 # $TMUX_PANE is inherited from the pane claude runs in; query by pane rather
 # than by client, which is ambiguous when several clients are attached.
 pane="${TMUX_PANE:-}"
 [[ -n "$pane" ]] || exit 0
-session=$(tmux display-message -t "$pane" -p '#{session_name}' 2>/dev/null) || exit 0
-
-CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
-if [[ -f "$CONFIG_FILE" ]]; then
-    bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
-fi
-TARGET="${DICTATE_TARGET:-claude}"
-[[ "$session" == "$TARGET" ]] || exit 0
 
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+
+# When claude-roster is in play, exactly one pane is audible: the focused one.
+# A file read is also cheaper than the tmux query below, which matters because
+# MessageDisplay fires per streaming delta. No focus file means no roster —
+# fall back to the session-name gate, so a single-pane setup behaves as ever.
+focus=$(cat "$RUN_DIR/focus-pane" 2>/dev/null)
+if [[ -n "$focus" ]]; then
+    [[ "$pane" == "$focus" ]] || exit 0
+else
+    session=$(tmux display-message -t "$pane" -p '#{session_name}' 2>/dev/null) || exit 0
+    CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+    fi
+    TARGET="${DICTATE_TARGET:-claude}"
+    [[ "$session" == "$TARGET" ]] || exit 0
+fi
+
 LEDGER_DIR="$RUN_DIR/spoken"
 
 # Resolve the sibling script rather than trusting PATH — a hook's environment

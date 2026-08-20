@@ -12,6 +12,20 @@
 #   "<callsign>, radio check"      hear the current state
 #   "<callsign>, help"             hear the protocol
 #
+# With named instances up (see claude-roster), an instance's name takes the
+# callsign's place and the callsign becomes the management channel:
+#
+#   "alpha, come in"  ... "alpha, out"       dictate to instance alpha
+#   "alpha, focus"                           make alpha the audible one
+#   "<callsign>, spawn"                      new named instance
+#   "<callsign>, list"                       who is up, who is focused
+#   "<callsign>, kill charlie"               kill an instance
+#   "<callsign>, rename bravo to alpha"      retarget a name
+#   "<callsign>, reap"                       drop hand-closed panes
+#
+# Only the focused instance is audible; opening the mic to one focuses it.
+# With no instances the callsign works exactly as it always has.
+#
 # The safety of this comes from POSITION, not from picking a rare word — any
 # word you choose you will eventually say. A standalone command must be the
 # *entire* utterance, so "then Skylark comes in" can never fire it, and the
@@ -19,18 +33,23 @@
 # no escape hatch is needed: you can talk about the commands freely.
 #
 # Config: env vars, or ~/.config/claude-dictate/config (shared with the other
-# two scripts):
+# scripts):
 #
 #   LISTEN_CALLSIGN    the callsign          (default: skylark)
 #   LISTEN_ALIASES     ;-separated extra spellings whisper might produce
 #                      (default covers what whisper has actually produced
 #                      for "skylark", including "Scarlett")
+#   LISTEN_POOL        instance names, space-separated
+#                      (default: alpha bravo charlie delta echo foxtrot)
+#   LISTEN_POOL_ALIASES  name:alias,alias;name:alias — whisper misspellings
+#                      per pool name (defaults built in)
 #   LISTEN_MAX_TX      seconds before an unclosed transmission sends itself
 #                      (default: 90)
 #   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
 #   LISTEN_CLOSE_MS    silence that ends an utterance (700)
 #
-# Reuses DICTATE_WHISPER / DICTATE_MODEL / DICTATE_RECORDER / DICTATE_TARGET.
+# Reuses DICTATE_WHISPER / DICTATE_MODEL / DICTATE_RECORDER / DICTATE_TARGET;
+# claude-roster adds DICTATE_SPAWN_CMD for what a spawned pane runs.
 set -u
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -51,18 +70,33 @@ RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
 TARGET="${DICTATE_TARGET:-claude}"
 CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
 ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark;scarlett;scarlet;skylarke;sky lock;skylab;sly lark}"
+POOL="${LISTEN_POOL:-alpha bravo charlie delta echo foxtrot}"
+POOL_ALIASES="${LISTEN_POOL_ALIASES:-alpha:alfa;bravo:brava,brovo;charlie:charley,charly;echo:eco,ecko;foxtrot:fox trot,foxtrott,fox trott}"
 MAX_TX="${LISTEN_MAX_TX:-90}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
+ROSTER_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/roster"
 
-# Every accepted spelling of the callsign. Aliases exist because whisper will
-# occasionally split or mangle a proper noun; the whole-utterance rule keeps the
-# extra surface from mattering.
-CALLSIGNS=("$CALLSIGN")
-while IFS= read -r -d ';' a; do [[ -n "$a" ]] && CALLSIGNS+=("$a"); done <<<"$ALIASES;"
+# One spoken-form → canonical-name map covering the callsign and every pool
+# name. Aliases exist because whisper will occasionally split or mangle a
+# proper noun; the whole-utterance rule keeps the extra surface from
+# mattering. The grammar matches spoken forms; everything downstream of it
+# sees only canonical names.
+declare -A NAME_OF=(["$CALLSIGN"]="$CALLSIGN")
+while IFS= read -r -d ';' a; do [[ -n "$a" ]] && NAME_OF["$a"]="$CALLSIGN"; done <<<"$ALIASES;"
+for _n in $POOL; do NAME_OF["$_n"]="$_n"; done
+while IFS= read -r -d ';' _entry; do
+    [[ "$_entry" == *:* ]] || continue
+    _n="${_entry%%:*}"
+    [[ " $POOL " == *" $_n "* ]] || continue
+    while IFS= read -r -d ',' _a; do [[ -n "$_a" ]] && NAME_OF["$_a"]="$_n"; done <<<"${_entry#*:},"
+done <<<"$POOL_ALIASES;"
+unset _n _a _entry
 
-# Spoken phrase -> action. Kept small and closed on purpose: a large command
-# vocabulary is a large accidental-trigger surface.
+# Spoken phrase -> action, valid after any name. Kept small and closed on
+# purpose: a large command vocabulary is a large accidental-trigger surface.
+# "focus" is instance-only (focusing the callsign means nothing) and is
+# filtered in the matcher.
 declare -A PROWORDS=(
     ["come in"]=open
     ["out"]=close
@@ -70,6 +104,15 @@ declare -A PROWORDS=(
     ["silence"]=hush
     ["radio check"]=status
     ["help"]=help
+    ["focus"]=focus
+)
+# Management verbs, valid after the callsign only. kill and rename are
+# handled apart from this table — no proword takes an argument.
+declare -A MGMT=(
+    ["spawn"]=spawn
+    ["list"]=list
+    ["status"]=status
+    ["reap"]=reap
 )
 # Only these may appear at the end of a real transmission; the rest are
 # standalone-only, which is what keeps them out of dictated prose.
@@ -84,30 +127,61 @@ normalize() {
         | sed -E "s/[^a-z0-9 ]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//"
 }
 
-# Echo the action when the WHOLE utterance is callsign + proword. Anything
-# else — a longer sentence that merely contains the phrase — is not a command.
+# canon_name(spoken) — resolve a command's ARGUMENT through the alias map.
+# Unknown spellings pass through unresolved, so the error can name what was
+# actually heard.
+canon_name() { printf '%s' "${NAME_OF[$1]:-$1}"; }
+
+# Echo "name<TAB>action[<TAB>arg[<TAB>arg]]" when the WHOLE utterance is a
+# command: "<name>, <proword>", or a management command on the callsign.
+# Anything else — a longer sentence that merely contains the phrase — is not
+# a command.
 standalone_command() {
-    local n="$1" cs pw
-    for cs in "${CALLSIGNS[@]}"; do
+    local n="$1" cs pw name rest
+    for cs in "${!NAME_OF[@]}"; do
+        name="${NAME_OF[$cs]}"
         for pw in "${!PROWORDS[@]}"; do
-            [[ "$n" == "$cs $pw" ]] && { printf '%s' "${PROWORDS[$pw]}"; return 0; }
+            [[ "$n" == "$cs $pw" ]] || continue
+            [[ "$pw" == focus && "$name" == "$CALLSIGN" ]] && continue
+            printf '%s\t%s' "$name" "${PROWORDS[$pw]}"
+            return 0
         done
+        [[ "$name" == "$CALLSIGN" ]] || continue
+        for pw in "${!MGMT[@]}"; do
+            [[ "$n" == "$cs $pw" ]] && { printf '%s\t%s' "$name" "${MGMT[$pw]}"; return 0; }
+        done
+        # The two commands that take arguments. Still whole-utterance: a
+        # prefix match here is only reached when the utterance STARTS with
+        # the callsign, and the argument is everything after the verb.
+        if [[ "$n" == "$cs kill "* ]]; then
+            printf '%s\tkill\t%s' "$name" "$(canon_name "${n#"$cs kill "}")"
+            return 0
+        fi
+        if [[ "$n" == "$cs rename "* ]]; then
+            rest="${n#"$cs rename "}"
+            [[ "$rest" == *" to "* ]] || continue
+            printf '%s\trename\t%s\t%s' "$name" \
+                "$(canon_name "${rest%% to *}")" "$(canon_name "${rest#* to }")"
+            return 0
+        fi
     done
     return 1
 }
 
-# Echo "action<TAB>remainder" when the utterance ENDS with callsign + proword.
-# The closing commands have to live here because they necessarily terminate a
-# transmission that carries content — they can't be standalone.
+# Echo "name<TAB>action<TAB>remainder" when the utterance ENDS with a name +
+# closing proword. The closing commands have to live here because they
+# necessarily terminate a transmission that carries content — they can't be
+# standalone.
 terminal_command() {
-    local n="$1" cs pw suffix rest
-    for cs in "${CALLSIGNS[@]}"; do
+    local n="$1" cs pw name suffix rest
+    for cs in "${!NAME_OF[@]}"; do
+        name="${NAME_OF[$cs]}"
         for pw in "${TERMINAL[@]}"; do
             suffix="$cs $pw"
             if [[ "$n" == "$suffix" || "$n" == *" $suffix" ]]; then
                 rest="${n%"$suffix"}"
                 rest="${rest% }"
-                printf '%s\t%s' "${PROWORDS[$pw]}" "$rest"
+                printf '%s\t%s\t%s' "$name" "${PROWORDS[$pw]}" "$rest"
                 return 0
             fi
         done
@@ -160,6 +234,10 @@ To throw it away instead, finish with $c, disregard. \
 While the mic is closed you can also say $c, silence, to stop me talking. \
 $c, radio check, to hear the current state. \
 Or $c, help, to hear this again. \
+With named instances up, the instance name takes the callsign's place: \
+alpha, come in. alpha, out. And alpha, focus, makes it the one you hear. \
+Manage instances with $c, spawn. $c, list. $c, kill, then the name. \
+$c, rename, old name, to, new name. Or $c, reap, to drop dead ones. \
 A command only counts when it is the whole thing you said, so you can talk \
 about these words without setting them off."
 }
@@ -169,6 +247,7 @@ about these words without setting them off."
 STATE=standby
 BUFFER=""
 TX_START=0
+TX_TARGET=""     # canonical name the open transmission belongs to
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
 
@@ -177,19 +256,136 @@ transcribe() {
         2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
+# All roster traffic funnels through one seam, so the tests can fake the
+# roster without a tmux server.
+roster() { "$HERE/claude-roster" "$@"; }
+
 send_buffer() {
     local text="$1"
     [[ -n "$text" ]] || { tone err; notify critical 3000 "nothing to send"; return 0; }
-    if "$HERE/claude-dictate" --send "$text"; then
-        log "sent: $text"
+    local -a to=()
+    [[ -n "$TX_TARGET" && "$TX_TARGET" != "$CALLSIGN" ]] && to=(--to "$TX_TARGET")
+    if "$HERE/claude-dictate" --send "${to[@]}" "$text"; then
+        log "sent${to[1]:+ to ${to[1]}}: $text"
         notify normal 5000 "➜ $text"
     else
-        notify critical 5000 "could not reach the '$TARGET' tmux session"
+        notify critical 5000 "could not reach ${to[1]:-the '$TARGET' tmux session}"
+    fi
+}
+
+# ----------------------------------------------------------- voice commands --
+
+# "Two. alpha, focused. bravo." — what "list" speaks.
+list_text() {
+    local lines n out name pane foc
+    lines=$(roster list 2>/dev/null)
+    [[ -n "$lines" ]] || { printf 'No instances.'; return 0; }
+    n=$(grep -c . <<<"$lines")
+    out="$n."
+    while IFS=$'\t' read -r name pane foc; do
+        [[ -n "$name" ]] || continue
+        if [[ "$foc" == focused ]]; then out="$out $name, focused."; else out="$out $name."; fi
+    done <<<"$lines"
+    printf '%s' "$out"
+}
+
+status_text() {
+    local roster_part
+    roster_part=$(list_text)
+    if [[ "$roster_part" == "No instances." ]]; then printf 'Standing by.'
+    else printf 'Standing by. %s' "$roster_part"; fi
+}
+
+cmd_open() {
+    local who="$1"
+    if [[ "$who" == "$CALLSIGN" ]]; then
+        # The callsign opens the mic only while no instances exist — that's
+        # the whole single-pane setup, unchanged. With a roster up it would
+        # be ambiguous which claude you meant.
+        if [[ -n "$(roster list 2>/dev/null)" ]]; then
+            tone err; log "callsign open refused: instances are up"
+            notify critical 4000 "instances are up — open one by name"
+            return 0
+        fi
+    else
+        if ! roster pane "$who" >/dev/null 2>&1; then
+            tone err; log "open refused: no instance $who"
+            notify critical 4000 "no instance $who — say \"$CALLSIGN, spawn\""
+            return 0
+        fi
+        # Opening the mic to an instance makes it the audible one.
+        roster focus "$who" >/dev/null 2>&1
+    fi
+    TX_TARGET="$who"
+    STATE=transmitting; BUFFER=""; TX_START=$SECONDS
+    tone open; log "mic open for $who"
+    notify low 90000 "🔴 mic open ($who) — \"$who, out\" to send"
+}
+
+cmd_focus() {
+    local who="$1"
+    if roster focus "$who" >/dev/null 2>&1; then
+        tone ack; log "focused $who"
+        notify low 3000 "focused $who"
+    else
+        tone err
+        notify critical 4000 "no instance $who"
+    fi
+}
+
+cmd_spawn() {
+    local out name
+    if out=$(roster spawn 2>&1); then
+        name="${out%%$'\t'*}"
+        tone ack; log "spawned $name"
+        speak "$name up."
+        notify normal 4000 "spawned $name"
+    else
+        tone err; log "spawn failed: $out"
+        speak "Spawn failed."
+        notify critical 5000 "spawn failed: $out"
+    fi
+}
+
+cmd_kill() {
+    local who="$1"
+    if roster kill "$who" >/dev/null 2>&1; then
+        tone ack; log "killed $who"
+        speak "$who down."
+        notify normal 4000 "killed $who"
+    else
+        tone err
+        notify critical 4000 "no instance $who"
+    fi
+}
+
+cmd_rename() {
+    local old="$1" new="$2"
+    if roster rename "$old" "$new" >/dev/null 2>&1; then
+        tone ack; log "renamed $old to $new"
+        speak "$old is now $new."
+        notify normal 4000 "renamed $old to $new"
+    else
+        tone err
+        notify critical 4000 "cannot rename $old to $new"
+    fi
+}
+
+cmd_reap() {
+    local dropped n
+    dropped=$(roster reap 2>/dev/null)
+    n=$(grep -c . <<<"$dropped")
+    if (( n == 0 )); then
+        tone ack; speak "Roster clean."
+    else
+        tone ack; log "reaped: $(tr '\n' ' ' <<<"$dropped")"
+        speak "Reaped $(paste -sd', ' <<<"$dropped")."
+        notify normal 4000 "reaped $(paste -sd', ' <<<"$dropped")"
     fi
 }
 
 handle() {
-    local wav="$1" text norm act out rest
+    local wav="$1" text norm out who act a1 a2 rest s
     text=$(transcribe "$wav")
     rm -f "$wav"
     norm=$(normalize <<<"$text")
@@ -201,15 +397,20 @@ handle() {
     if [[ "$STATE" == standby ]]; then
         # In standby nothing is dictation — an utterance is either a command
         # or it is ignored outright.
-        act=$(standalone_command "$norm") || { log "ignored: $norm"; return 0; }
+        out=$(standalone_command "$norm") || { log "ignored: $norm"; return 0; }
+        IFS=$'\t' read -r who act a1 a2 <<<"$out"
         case "$act" in
-            open)   STATE=transmitting; BUFFER=""; TX_START=$SECONDS
-                    tone open; log "mic open"
-                    notify low 90000 "🔴 mic open — \"$CALLSIGN, out\" to send" ;;
+            open)   cmd_open "$who" ;;
             hush)   "$HERE/claude-speak" --stop; tone ack
                     notify low 2000 "stopped speaking" ;;
-            status) speak "Standing by."; notify low 3000 "standing by" ;;
+            status) s=$(status_text); speak "$s"; notify low 3000 "$s" ;;
             help)   speak "$(help_text)"; notify low 6000 "reading out the protocol" ;;
+            focus)  cmd_focus "$who" ;;
+            spawn)  cmd_spawn ;;
+            list)   s=$(list_text); speak "$s"; notify low 5000 "$s" ;;
+            reap)   cmd_reap ;;
+            kill)   cmd_kill "$a1" ;;
+            rename) cmd_rename "$a1" "$a2" ;;
             close|cancel) tone err; log "close command with mic already shut"
                     notify critical 3000 "mic is already closed" ;;
         esac
@@ -217,13 +418,19 @@ handle() {
     fi
 
     if out=$(terminal_command "$norm"); then
-        act="${out%%$'\t'*}"
-        rest="${out#*$'\t'}"
+        IFS=$'\t' read -r who act rest <<<"$out"
+        # A close addressed to the wrong name is a mistake worth hearing
+        # about, not a silent redirect of the whole transmission.
+        if [[ "$who" != "$TX_TARGET" ]]; then
+            tone err; log "close addressed to $who but the mic is open for $TX_TARGET"
+            notify critical 4000 "mic is open for $TX_TARGET — close with \"$TX_TARGET, out\""
+            return 0
+        fi
         case "$act" in
             close)  [[ -n "$rest" ]] && BUFFER="${BUFFER:+$BUFFER }$rest"
                     STATE=standby; tone close
-                    send_buffer "$BUFFER"; BUFFER="" ;;
-            cancel) STATE=standby; BUFFER=""; tone abort; log "discarded"
+                    send_buffer "$BUFFER"; BUFFER=""; TX_TARGET="" ;;
+            cancel) STATE=standby; BUFFER=""; TX_TARGET=""; tone abort; log "discarded"
                     notify normal 2500 "discarded" ;;
         esac
         return 0
@@ -244,7 +451,7 @@ check_timeout() {
     log "max transmission reached — sending"
     notify normal 4000 "max transmission reached — sending"
     STATE=standby; tone close
-    send_buffer "$BUFFER"; BUFFER=""
+    send_buffer "$BUFFER"; BUFFER=""; TX_TARGET=""
 }
 
 # ------------------------------------------------------------------ control --

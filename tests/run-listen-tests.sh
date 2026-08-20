@@ -18,6 +18,10 @@ SANDBOX="$(mktemp -d)"
 # writes, so it must be reaped by path or it lingers for its full sleep.
 trap 'pkill -f "$SANDBOX" 2>/dev/null; rm -rf "$SANDBOX"' EXIT
 
+# A set TMUX would let anything that reaches a real tmux client target the
+# server hosting this very test run (see run-tests.sh for the incident).
+unset TMUX TMUX_PANE
+
 # Keep the user's real config out of the run; the defaults are what we assert.
 export XDG_CONFIG_HOME="$SANDBOX/config"
 export XDG_RUNTIME_DIR="$SANDBOX/runtime"
@@ -41,11 +45,11 @@ eq "strips a trailing period"         "$(normalize <<<'skylark out.')"      "sky
 echo "# standalone commands"
 try_standalone() { standalone_command "$(normalize <<<"$1")" || printf '(none)'; }
 
-eq "come in opens"                 "$(try_standalone 'Skylark, come in.')"    "open"
-eq "help is recognized"            "$(try_standalone 'skylark help')"         "help"
-eq "radio check is recognized"     "$(try_standalone 'Skylark, radio check')" "status"
-eq "silence is recognized"         "$(try_standalone 'skylark silence')"      "hush"
-eq "an alias spelling still works" "$(try_standalone 'Sky lark, come in')"    "open"
+eq "come in opens"                 "$(try_standalone 'Skylark, come in.')"    $'skylark\topen'
+eq "help is recognized"            "$(try_standalone 'skylark help')"         $'skylark\thelp'
+eq "radio check is recognized"     "$(try_standalone 'Skylark, radio check')" $'skylark\tstatus'
+eq "silence is recognized"         "$(try_standalone 'skylark silence')"      $'skylark\thush'
+eq "an alias spelling still works" "$(try_standalone 'Sky lark, come in')"    $'skylark\topen'
 
 # The whole-utterance rule is the thing that makes the protocol safe: these are
 # all sentences a person says while describing the system.
@@ -56,16 +60,45 @@ eq "callsign alone does not fire"     "$(try_standalone 'skylark')"             
 eq "proword alone does not fire"      "$(try_standalone 'come in')"                              "(none)"
 eq "wrong callsign does not fire"     "$(try_standalone 'seagull come in')"                      "(none)"
 
+# --- instance and management grammar -----------------------------------------
+echo "# instance and management grammar"
+# Pool names take the callsign's position; the callsign takes the management
+# verbs; both resolve whisper's misspellings to canonical names.
+eq "an instance name opens"          "$(try_standalone 'Alpha, come in.')"     $'alpha\topen'
+eq "an instance alias resolves"      "$(try_standalone 'Charley, come in')"    $'charlie\topen'
+eq "focus is an instance command"    "$(try_standalone 'bravo focus')"         $'bravo\tfocus'
+eq "focus on the callsign is not"    "$(try_standalone 'skylark focus')"       "(none)"
+eq "spawn is recognized"             "$(try_standalone 'Skylark, spawn.')"     $'skylark\tspawn'
+eq "list is recognized"              "$(try_standalone 'skylark list')"        $'skylark\tlist'
+eq "reap is recognized"              "$(try_standalone 'skylark reap')"        $'skylark\treap'
+eq "status is recognized"            "$(try_standalone 'skylark status')"      $'skylark\tstatus'
+eq "spawn on an instance is not"     "$(try_standalone 'alpha spawn')"         "(none)"
+eq "kill carries its argument"       "$(try_standalone 'Skylark, kill charlie')" $'skylark\tkill\tcharlie'
+eq "kill resolves an alias argument" "$(try_standalone 'skylark kill charley')"  $'skylark\tkill\tcharlie'
+eq "rename carries both arguments"   "$(try_standalone 'skylark rename bravo to alpha')" \
+                                     $'skylark\trename\tbravo\talpha'
+eq "rename resolves alias arguments" "$(try_standalone 'skylark rename brava to alfa')" \
+                                     $'skylark\trename\tbravo\talpha'
+eq "rename without to does not fire" "$(try_standalone 'skylark rename bravo alpha')"   "(none)"
+eq "kill on an instance is not a command" "$(try_standalone 'alpha kill bravo')"        "(none)"
+eq "kill inside prose does not fire" "$(try_standalone 'and then skylark kill charlie happened')" "(none)"
+eq "instance name alone does not fire" "$(try_standalone 'alpha')"                      "(none)"
+eq "instance phrase with a suffix does not fire" "$(try_standalone 'alpha come in here')" "(none)"
+
 # --- terminal commands ------------------------------------------------------
 echo "# terminal commands"
 try_terminal() { terminal_command "$(normalize <<<"$1")" || printf '(none)'; }
 
 eq "out closes and returns the remainder" \
-   "$(try_terminal 'fix the parser please Skylark, out.')" "$(printf 'close\tfix the parser please')"
+   "$(try_terminal 'fix the parser please Skylark, out.')" "$(printf 'skylark\tclose\tfix the parser please')"
 eq "disregard cancels" \
-   "$(try_terminal 'scratch that Skylark disregard')"      "$(printf 'cancel\tscratch that')"
+   "$(try_terminal 'scratch that Skylark disregard')"      "$(printf 'skylark\tcancel\tscratch that')"
 eq "a bare close has an empty remainder" \
-   "$(try_terminal 'skylark out')"                         "$(printf 'close\t')"
+   "$(try_terminal 'skylark out')"                         "$(printf 'skylark\tclose\t')"
+eq "an instance close carries its name" \
+   "$(try_terminal 'run the tests alpha out')"             "$(printf 'alpha\tclose\trun the tests')"
+eq "an instance alias close resolves" \
+   "$(try_terminal 'run the tests charley out')"           "$(printf 'charlie\tclose\trun the tests')"
 
 # Ending a technical sentence with these words is entirely plausible, which is
 # why the callsign has to be attached.
@@ -82,9 +115,26 @@ NEXT_TEXT=""
 transcribe()  { printf '%s' "$NEXT_TEXT"; }
 tone()        { TONES="${TONES:+$TONES }$1"; }
 speak()       { SPOKEN="${SPOKEN:+$SPOKEN | }$1"; }
-send_buffer() { SENT="${SENT:+$SENT | }$1"; }
+send_buffer() { SENT="${SENT:+$SENT | }$1"; SENT_TO="$TX_TARGET"; }
 notify()      { NOTES="${NOTES:+$NOTES | }$3"; }   # also keeps real popups out of a test run
 log()         { :; }
+
+# Fake roster: FAKE_ROSTER holds `claude-roster list` output; ROSTER_CALLS
+# records every subcommand, so a test can assert what the voice layer asked
+# the substrate to do without a tmux server in the room.
+FAKE_ROSTER=""; ROSTER_CALLS=""
+roster() {
+    ROSTER_CALLS="${ROSTER_CALLS:+$ROSTER_CALLS }$*"
+    case "$1" in
+        list)   printf '%s' "$FAKE_ROSTER" ;;
+        pane|focus|kill)
+                awk -F'\t' -v n="$2" '$1 == n { print $2; found=1 } END { exit !found }' \
+                    <<<"$FAKE_ROSTER" >/dev/null || return 1 ;;
+        rename) grep -q "^$2	" <<<"$FAKE_ROSTER" || return 1 ;;
+        spawn)  printf 'alpha\t%%9\n' ;;
+        reap)   printf '%s' "${FAKE_REAPED:-}" ;;
+    esac
+}
 
 say() { NEXT_TEXT="$1"; handle "$SANDBOX/nonexistent.wav"; }
 
@@ -145,6 +195,101 @@ STATE=transmitting; BUFFER="a long thought"; SENT=""; TX_START=$SECONDS; MAX_TX=
 check_timeout
 eq "timeout closes the mic"  "$STATE" "standby"
 eq "timeout sends the buffer" "$SENT" "a long thought"
+
+# --- named instances ----------------------------------------------------------
+echo "# named instances"
+# With a roster up, the instance name is the callsign and the callsign is
+# management-only. Roster effects are asserted through the fake's call log.
+FAKE_ROSTER=$'alpha\t%1\tfocused\nbravo\t%2\t-'
+
+STATE=standby; BUFFER=""; SENT=""; SENT_TO=""; TONES=""; ROSTER_CALLS=""; TX_TARGET=""
+say "Alpha, come in."
+eq "an instance opens the mic"        "$STATE" "transmitting"
+eq "the transmission is owned by it"  "$TX_TARGET" "alpha"
+if grep -q "focus alpha" <<<"$ROSTER_CALLS"; then ok "opening focuses the instance"
+else no "opening focuses the instance" "calls: $ROSTER_CALLS"; fi
+
+say "run the test suite"
+say "bravo out"
+eq "a close under the wrong name does not send"  "$SENT" ""
+eq "the wrong-name close keeps transmitting"     "$STATE" "transmitting"
+if grep -qw err <<<"$TONES"; then ok "the wrong-name close sounds the error tone"
+else no "the wrong-name close sounds the error tone" "tones: $TONES"; fi
+
+say "alpha out"
+eq "the right name closes and sends"      "$SENT" "run the test suite"
+eq "the send is routed to the instance"   "$SENT_TO" "alpha"
+eq "closing clears the target"            "$TX_TARGET" ""
+
+# the callsign is refused as a dictation channel while instances are up
+STATE=standby; BUFFER=""; SENT=""; TONES=""
+say "skylark come in"
+eq "the callsign cannot open with instances up" "$STATE" "standby"
+if grep -qw err <<<"$TONES"; then ok "the refused open sounds the error tone"
+else no "the refused open sounds the error tone" "tones: $TONES"; fi
+
+# an instance that was never spawned cannot open the mic
+STATE=standby; TONES=""; NOTES=""
+say "delta, come in"
+eq "an unknown instance cannot open"   "$STATE" "standby"
+if grep -qF "no instance delta" <<<"$NOTES"; then ok "the refusal names the instance"
+else no "the refusal names the instance" "notes: $NOTES"; fi
+
+# management commands
+STATE=standby; SPOKEN=""; ROSTER_CALLS=""
+say "skylark spawn"
+if grep -qF "alpha up." <<<"$SPOKEN"; then ok "spawn speaks the new name"
+else no "spawn speaks the new name" "spoke: $SPOKEN"; fi
+
+SPOKEN=""
+say "skylark list"
+eq "list speaks the roster" "$SPOKEN" "2. alpha, focused. bravo."
+
+SPOKEN=""
+say "skylark status"
+eq "status includes the roster" "$SPOKEN" "Standing by. 2. alpha, focused. bravo."
+
+SPOKEN=""; ROSTER_CALLS=""
+say "skylark kill bravo"
+if grep -qF "bravo down." <<<"$SPOKEN"; then ok "kill speaks the takedown"
+else no "kill speaks the takedown" "spoke: $SPOKEN"; fi
+if grep -q "kill bravo" <<<"$ROSTER_CALLS"; then ok "kill reaches the roster"
+else no "kill reaches the roster" "calls: $ROSTER_CALLS"; fi
+
+TONES=""; SPOKEN=""
+say "skylark kill charlie"
+eq "killing an unknown instance speaks nothing" "$SPOKEN" ""
+if grep -qw err <<<"$TONES"; then ok "killing an unknown instance errors"
+else no "killing an unknown instance errors" "tones: $TONES"; fi
+
+SPOKEN=""
+say "skylark rename bravo to charlie"
+if grep -qF "bravo is now charlie." <<<"$SPOKEN"; then ok "rename speaks the change"
+else no "rename speaks the change" "spoke: $SPOKEN"; fi
+
+SPOKEN=""; ROSTER_CALLS=""
+say "bravo focus"
+if grep -q "focus bravo" <<<"$ROSTER_CALLS"; then ok "focus reaches the roster"
+else no "focus reaches the roster" "calls: $ROSTER_CALLS"; fi
+
+SPOKEN=""; FAKE_REAPED=$'charlie\n'
+say "skylark reap"
+if grep -qF "Reaped charlie." <<<"$SPOKEN"; then ok "reap names the dropped"
+else no "reap names the dropped" "spoke: $SPOKEN"; fi
+FAKE_REAPED=""; SPOKEN=""
+say "skylark reap"
+if grep -qF "Roster clean." <<<"$SPOKEN"; then ok "a clean reap says so"
+else no "a clean reap says so" "spoke: $SPOKEN"; fi
+
+# mid-transmission, management words are dictation like everything else
+STATE=standby; BUFFER=""; SENT=""; SPOKEN=""
+say "alpha come in"
+say "skylark kill bravo"
+eq "management inside a transmission is dictated" "$BUFFER" "skylark kill bravo"
+eq "management inside a transmission speaks nothing" "$SPOKEN" ""
+say "alpha disregard"
+
+FAKE_ROSTER=""   # back to classic single-pane mode for the sections below
 
 # --- desktop notifications --------------------------------------------------
 # The mic state has to be visible without listening for a tone, so the open /
@@ -252,6 +397,29 @@ missing_out=$(env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
 eq "a missing recorder is refused at startup" "$missing_st" "1"
 if grep -q "recorder not found" <<<"$missing_out"; then ok "the recorder refusal says why"
 else no "the recorder refusal says why" "got: $missing_out"; fi
+
+# --- segmenter: ambient step ---------------------------------------------------
+# Field failure: the noise floor only learned from frames it already considered
+# quiet, so a step-up in ambient noise (wireless hiss, a fan) made EVERY frame
+# read as speech and the mic stuck open until max-ms glued a minute of commands
+# into one rejected utterance. With the fix the floor climbs 1 dB/s on loud
+# frames too, so segments must keep closing after the step.
+echo "# segmenter"
+SEGOUT="$SANDBOX/seg"; mkdir -p "$SEGOUT"
+utts=$(python3 - <<'PY' | timeout 15 python3 "$TESTS_DIR/../listen-segmenter.py" --outdir "$SEGOUT" 2>/dev/null | wc -l
+import math, struct, sys
+out, RATE = sys.stdout.buffer, 16000
+def block(amp, secs, freq=200):
+    for i in range(int(RATE * secs)):
+        out.write(struct.pack('<h', int(amp * math.sin(2*math.pi*freq*i/RATE))))
+block(50, 2)      # establish a quiet floor (~ -59 dBFS)
+block(260, 5)     # ambient steps up ~14 dB — just past the 12 dB margin
+block(8000, 0.6)  # a spoken command
+block(260, 2)     # back to the new ambient, so the command can close
+PY
+)
+if (( utts >= 1 )); then ok "utterances still close after an ambient noise step (got $utts)"
+else no "utterances still close after an ambient noise step" "got $utts closed utterances"; fi
 
 echo
 echo "passed: $pass  failed: $fail"

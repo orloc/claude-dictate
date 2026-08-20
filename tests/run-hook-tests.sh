@@ -86,6 +86,30 @@ eq "prompt in another session does NOT stop speech" "$(stops)" "0"
 fire '{"hook_event_name":"UserPromptSubmit"}'
 eq "prompt in the dictation session stops speech" "$(stops)" "1"
 
+echo "# focus gating"
+# With claude-roster in play the focused pane is the only audible one, whatever
+# session it sits in — the session gate (and its tmux call) is bypassed.
+reset
+mkdir -p "$RUNTIME/claude-dictate"
+printf '%%1' > "$RUNTIME/claude-dictate/focus-pane"
+fire "$(stop_payload f1 'focused pane speaks')" FAKE_SESSION=whatever
+eq "the focused pane speaks regardless of session" "$(spoke)" "focused pane speaks"
+
+printf '%%2' > "$RUNTIME/claude-dictate/focus-pane"
+fire "$(stop_payload f2 'should not speak')"
+eq "an unfocused pane stays silent" "$(spoke)" "focused pane speaks"
+fire '{"hook_event_name":"UserPromptSubmit"}'
+eq "an unfocused pane cannot stop speech" "$(stops)" "0"
+
+printf '%%1' > "$RUNTIME/claude-dictate/focus-pane"
+fire '{"hook_event_name":"UserPromptSubmit"}'
+eq "the focused pane stops speech" "$(stops)" "1"
+
+rm -f "$RUNTIME/claude-dictate/focus-pane"
+fire "$(stop_payload f3 'back to session gating')"
+eq "no focus file falls back to the session gate" \
+   "$(flat)" $'focused pane speaks\nback to session gating'
+
 echo "# MessageDisplay"
 # A message arrives as a RUN of deltas sharing one message_id, each carrying
 # only its own new text, with only the last marked final. The suite used to
