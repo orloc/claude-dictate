@@ -45,6 +45,7 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 
 payload=$(cat)
 
+
 # One jq pass for the scalars. Every field is forced non-empty ("-" for
 # absent/empty) BEFORE @tsv: tab is IFS whitespace to `read`, so an empty
 # field's adjacent tabs would collapse and shift every later field left —
@@ -96,21 +97,71 @@ UserPromptSubmit)
     ;;
 
 MessageDisplay)
-    # Deltas stream: only settled text is worth speaking, and speaking a
-    # partial would then repeat itself when the final one arrives.
-    [[ "$final" == "true" ]] || exit 0
-    text=$(jq -r '.delta // empty' <<<"$payload" 2>/dev/null)
-    [[ -n "$text" ]] || exit 0
+    # A message does NOT arrive whole. It streams as a run of deltas sharing one
+    # message_id, each carrying only its own new text, and ONLY THE LAST is
+    # marked final — so gating on `final` here spoke the closing paragraph of a
+    # long reply and silently dropped everything before it. Every delta is
+    # spoken; `final` marks the end of the run, not the part worth hearing.
+    # A delta's TRAILING newlines are the paragraph boundary this flushes on,
+    # and command substitution eats them — so the value is fenced with a
+    # sentinel, then the single newline `jq -r` appends is taken back off.
+    text=$(jq -r '.delta // empty' <<<"$payload" 2>/dev/null; printf X)
+    text=${text%X}; text=${text%$'\n'}
+    [[ -n "$text" || "$final" == "true" ]] || exit 0
+    idx=${index//[^0-9]/}; idx=${idx:-0}
 
-    # The message id is the whole dedup story here: exact, unique to this
-    # message, and indifferent to whether the same words were said before.
-    # (Hashing the text instead would mute a second identical reply — a
-    # later "Done." — for the rest of the session.)
-    claim "msg:$message_id:$index" || exit 0
+    # Dedup has to outlive the buffer: the buffer is torn down on final, so a
+    # redelivered final delta would otherwise restart from index 0 and speak
+    # the whole message again. The ledger is bounded and survives the teardown.
+    claim "msg:$message_id:$idx" || exit 0
+
+    # Deltas are buffered until they can be spoken SAFELY, for two reasons that
+    # both need more than one delta in hand: claude-speak strips a code block by
+    # matching a ``` PAIR, so flushing an odd fence count reads the code out
+    # loud, and flushing mid-sentence puts the pause in the wrong place. A flush
+    # wants balanced fences and a paragraph boundary — or `final`, after which
+    # no more text is coming and holding it back would lose it.
+    PARTIAL="$RUN_DIR/partial/${session_id}_${message_id}"
+    mkdir -p "$PARTIAL"
+    # Two deltas can be in flight at once, so each is named by its index and the
+    # run is reassembled in index order rather than in arrival order.
+    [[ -n "$text" ]] && printf '%s' "$text" > "$PARTIAL/$(printf '%06d' "$idx")"
+
+    exec 9>>"$PARTIAL.lock"
+    flock 9 || exit 0
+
+    cursor=$(cat "$PARTIAL/.cursor" 2>/dev/null); cursor=${cursor//[^0-9]/}
+    next=${cursor:-0}; buf=""
+    while [[ -f "$PARTIAL/$(printf '%06d' "$next")" ]]; do
+        chunk=$(cat "$PARTIAL/$(printf '%06d' "$next")"; printf X)
+        buf+="${chunk%X}"; next=$((next + 1))
+    done
+
+    # On final, salvage any index stranded behind a gap (a hook that failed or
+    # timed out) instead of letting the tail go unspoken.
+    if [[ "$final" == "true" ]]; then
+        for f in $(ls "$PARTIAL" 2>/dev/null | grep -E '^[0-9]{6}$' | sort); do
+            (( 10#$f >= next )) || continue
+            chunk=$(cat "$PARTIAL/$f"; printf X); buf+="${chunk%X}"
+            next=$((10#$f + 1))
+        done
+    fi
+
+    flush=""
+    fences=$(grep -o '```' <<<"$buf" | wc -l)
+    if [[ -n "$buf" ]] && (( fences % 2 == 0 )) \
+       && { [[ "$final" == "true" ]] || [[ "$buf" == *$'\n\n' ]]; }; then
+        flush="$buf"; printf '%s' "$next" > "$PARTIAL/.cursor"
+    fi
+    exec 9>&-
 
     # This marker is how Stop knows the turn was already spoken piecewise.
     mkdir -p "$LEDGER_DIR"; : > "$LEDGER.md-seen"
-    speak "$text"
+
+    # Outside the lock: claude-speak spools and queues, and a drainer must never
+    # wait on a buffer lock held across a read-aloud.
+    speak "$flush"
+    [[ "$final" == "true" ]] && rm -rf "$PARTIAL" "$PARTIAL.lock"
     ;;
 
 Stop|-)

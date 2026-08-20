@@ -61,6 +61,7 @@ fire() {
 }
 
 spoke()  { cat "$SPOKE" 2>/dev/null; }
+flat()   { tr -s '\n' < "$SPOKE" 2>/dev/null; }
 stops()  { wc -l < "$STOPS" 2>/dev/null || echo 0; }
 reset()  { : > "$SPOKE"; : > "$STOPS"; rm -rf "$RUNTIME/claude-dictate"; }
 
@@ -86,24 +87,63 @@ fire '{"hook_event_name":"UserPromptSubmit"}'
 eq "prompt in the dictation session stops speech" "$(stops)" "1"
 
 echo "# MessageDisplay"
+# A message arrives as a RUN of deltas sharing one message_id, each carrying
+# only its own new text, with only the last marked final. The suite used to
+# assert that a non-final delta stays silent — which is precisely how a long
+# reply came out as its closing paragraph and nothing else.
 reset
 fire "$(md s2 m1 0 true 'first message')"
-eq "a final delta is spoken" "$(spoke)" "first message"
+eq "a lone final delta is spoken" "$(spoke)" "first message"
 fire "$(md s2 m1 0 true 'first message')"
-eq "the same message id is not spoken twice" "$(spoke)" "first message"
-fire "$(md s2 m2 0 false 'partial')"
-eq "a non-final delta is not spoken" "$(spoke)" "first message"
+eq "a redelivered index is not spoken twice" "$(spoke)" "first message"
+
+reset
+fire "$(md s7 m1 0 false $'para one.\n\n')"
+fire "$(md s7 m1 1 false $'para two.\n\n')"
+fire "$(md s7 m1 2 true  'para three.')"
+eq "every delta of a message is spoken, in order" \
+   "$(flat)" $'para one.\npara two.\npara three.'
+
+reset
+fire "$(md s8 m1 0 false 'a sentence with no ')"
+fire "$(md s8 m1 1 true  'paragraph break in it')"
+eq "a delta mid-paragraph is held and joined, not dropped" \
+   "$(flat)" "a sentence with no paragraph break in it"
+
+# claude-speak strips a code block by matching a ``` PAIR, so a buffer flushed
+# with an odd fence count would read the code out loud.
+reset
+fire "$(md s9 m1 0 false $'here it is:\n\n')"
+fire "$(md s9 m1 1 false $'```\nrm -rf /\n\n')"
+eq "an open code fence holds the flush" "$(flat)" "here it is:"
+fire "$(md s9 m1 2 true $'```\n\nthat was it.')"
+eq "the fenced run is released once the pair closes" \
+   "$(flat)" $'here it is:\n```\nrm -rf /\n```\nthat was it.'
+
+# Two deltas can be in flight at once; order must come from the index.
+reset
+fire "$(md sA m1 1 false $'second.\n\n')"
+eq "a delta arriving early is held for its predecessor" "$(flat)" ""
+fire "$(md sA m1 0 false $'first.\n\n')"
+eq "the run is reassembled in index order" "$(flat)" $'first.\nsecond.'
+
+# A hook that failed or timed out leaves a hole. The tail must not be lost.
+reset
+fire "$(md sB m1 0 false $'opening.\n\n')"
+fire "$(md sB m1 2 true  'closing.')"
+eq "final salvages an index stranded behind a gap" "$(flat)" $'opening.\nclosing.'
 
 # The dedup regression that motivated the rewrite of the ledger: identical
 # text under a NEW message id is a new reply and must be spoken.
+reset
 fire "$(md s2 m3 0 true 'Done.')"
 fire "$(md s2 m4 0 true 'Done.')"
-eq "an identical later reply is still spoken" "$(spoke)" $'first message\nDone.\nDone.'
+eq "an identical later reply is still spoken" "$(flat)" $'Done.\nDone.'
 
 echo "# Stop vs MessageDisplay"
 fire "$(stop_payload s2 'Done.')"
 eq "Stop is silent when MessageDisplay already spoke this session" \
-   "$(spoke)" $'first message\nDone.\nDone.'
+   "$(flat)" $'Done.\nDone.'
 
 reset
 fire "$(stop_payload s3 'end of turn summary')"
