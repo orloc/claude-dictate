@@ -85,7 +85,7 @@ say() {
     # the run is detached; wait for it to finish rather than racing it
     local i
     for (( i = 0; i < 100; i++ )); do
-        pgrep -f "claude-speak --speak" >/dev/null 2>&1 || break
+        pgrep -f "claude-speak --drain" >/dev/null 2>&1 || break
         sleep 0.05
     done
     cat "$SPOKEN" 2>/dev/null
@@ -146,6 +146,13 @@ check "punctuation-only input synthesizes nothing" "$out" ""
 
 out=$(say 'This should stay quiet.' SPEAK_ENABLED=0)
 check "SPEAK_ENABLED=0 synthesizes nothing" "$out" ""
+
+# A missing engine must not leave the utterance in the spool: nothing will
+# ever consume it, and it would be spoken hours later when the engine appears.
+out=$(say 'never say this' SPEAK_ENGINE=/nonexistent/engine)
+check "missing engine synthesizes nothing" "$out" ""
+n=$(ls -1 "$RUNTIME/claude-dictate/spool" 2>/dev/null | wc -l)
+check "missing engine leaves an empty spool" "$n" "0"
 
 # --- chunking and truncation ------------------------------------------------
 long='One sentence here. Two sentence here. Three sentence here. Four sentence here.

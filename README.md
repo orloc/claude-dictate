@@ -84,8 +84,13 @@ A notification shows what was sent so you know it heard you right.
 ## Talking back
 
 `claude-speak` reads Claude's replies aloud with [Kokoro][kokoro] neural TTS,
-driven through the [sherpa-onnx][sherpa] offline-TTS CLI. It's wired in as a
-Claude Code `Stop` hook, so it fires whenever Claude finishes a response.
+driven through the [sherpa-onnx][sherpa] offline-TTS CLI. It's wired in via
+Claude Code hooks — and not just at the end of a turn: `MessageDisplay` speaks
+each assistant message as it appears, so a long working turn narrates itself
+(the sentence before each tool call) instead of staying silent until `Stop`.
+Utterances queue rather than cut each other off; `Stop` acts as the fallback
+for a Claude Code that doesn't emit `MessageDisplay`, with a per-session
+ledger making sure nothing is spoken twice.
 
 A response is markdown, and most of markdown is unlistenable — so the text is
 reduced before it's spoken: fenced code blocks and tables are dropped, link
@@ -108,16 +113,22 @@ ln -s "$PWD/claude-dictate/claude-speak"      ~/.local/bin/claude-speak
 ln -s "$PWD/claude-dictate/claude-speak-hook" ~/.local/bin/claude-speak-hook
 ```
 
-then adding the hooks to `~/.claude/settings.json`:
+then adding the hooks to `~/.claude/settings.json` — all three events route
+through `claude-speak-hook`, which is what session-gates them (a bare
+`claude-speak --stop` on UserPromptSubmit would let a prompt typed in any
+session on the machine cut off the dictation session mid-word):
 
 ```json
 {
   "hooks": {
+    "MessageDisplay": [
+      { "hooks": [{ "type": "command", "command": "claude-speak-hook", "timeout": 10 }] }
+    ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "claude-speak-hook", "timeout": 10 }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "claude-speak --stop", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "claude-speak-hook", "timeout": 5 }] }
     ]
   }
 }
@@ -295,7 +306,14 @@ would actually be spoken rather than about the cleaning regexes in isolation.
 script and replaces every side effect, so a whole session can be driven with
 no microphone, and so the tests can assert what was *not* done: that ordinary
 speech never dictates, that near-miss sentences never fire a command, and that
-help never reaches the dictation path.
+help never reaches the dictation path. The singleton tests run real background
+instances on fake binaries.
+
+`./tests/run-hook-tests.sh` — the speak hook end to end: payloads in, spoken
+text and `--stop` calls out, with a fake tmux deciding which session the hook
+thinks it's in. Mostly gating and dedup: wrong sessions stay silent, a repeat
+message id is spoken once, an identical *later* reply is still spoken, and
+Stop keeps quiet when MessageDisplay already narrated the turn.
 
 ## License
 

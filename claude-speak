@@ -6,8 +6,12 @@
 # Synthesis runs a chunk ahead of playback so speech starts in about a second
 # instead of after the whole response is rendered.
 #
-# Called with --stop it kills any in-flight playback, which is how the dictate
-# hotkey barges in mid-sentence.
+# Utterances QUEUE rather than supersede each other. A single turn arrives in
+# several pieces — the sentence before a tool call, the one after it, the
+# closing summary — and each has to wait its turn instead of cutting off the one
+# before. Interruption is explicit: --stop kills in-flight playback and drops
+# whatever is queued behind it, which is how the dictate hotkey and a new prompt
+# barge in mid-sentence.
 #
 # Config: env vars, or set them in ~/.config/claude-dictate/config (shared with
 # claude-dictate; plain shell, sourced if present):
@@ -23,6 +27,8 @@ set -u
 
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
 PGID_FILE="$RUN_DIR/speak.pgid"
+SPOOL="$RUN_DIR/spool"
+LOCKFILE="$RUN_DIR/speak.lock"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -93,7 +99,12 @@ fi
 
 # Kill the whole detached process group, so an in-flight sherpa or player dies
 # with it rather than finishing the sentence after we've been told to shut up.
+#
+# The queue is dropped BEFORE the kill: everything spooled behind the sentence
+# being cut off belongs to the same superseded turn, and a drainer waiting for
+# the lock would otherwise pick it up and carry on talking.
 stop_playback() {
+    rm -f "$SPOOL"/*.txt 2>/dev/null
     local pgid
     pgid=$(cat "$PGID_FILE" 2>/dev/null) || return 0
     rm -f "$PGID_FILE"
@@ -107,42 +118,93 @@ if [[ "${1:-}" == "--stop" ]]; then
     exit 0
 fi
 
-# --- detach -----------------------------------------------------------------
+# --- enqueue ----------------------------------------------------------------
 
-# The Stop hook must return immediately (it has a timeout, and playback can run
-# for a minute), so the first pass only slurps stdin and re-execs itself into
-# its own session. Being a session leader is also what makes the group kill in
-# stop_playback work.
-if [[ "${1:-}" != "--speak" ]]; then
-    mkdir -p "$RUN_DIR"
-    utt="$RUN_DIR/utt.$$.txt"
-    cat > "$utt"
-    [[ -s "$utt" ]] || { rm -f "$utt"; exit 0; }
-    [[ "$ENABLED" == "1" ]] || { rm -f "$utt"; exit 0; }
-    setsid --fork "$0" --speak "$utt" >/dev/null 2>&1 </dev/null
+# The hook must return immediately — it has a timeout, and playback can run for
+# a minute — so the first pass only slurps stdin into the spool and re-execs
+# itself detached to drain it. Being a session leader is also what makes the
+# group kill in stop_playback work.
+#
+# The name is a nanosecond stamp so the spool sorts into arrival order, which is
+# the order a turn's sentences have to be spoken in.
+if [[ "${1:-}" != "--drain" ]]; then
+    mkdir -p "$SPOOL"
+    tmp="$RUN_DIR/utt.$$.tmp"
+    cat > "$tmp"
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; exit 0; }
+    [[ "$ENABLED" == "1" ]] || { rm -f "$tmp"; exit 0; }
+    # move into the spool only once it's complete, so a drainer can never pick
+    # up a half-written utterance
+    mv "$tmp" "$SPOOL/$(date +%s%N).$$.txt"
+    setsid --fork "$0" --drain >/dev/null 2>&1 </dev/null
     exit 0
 fi
 
 # --- detached from here -----------------------------------------------------
 
-UTT="${2:-}"
-[[ -f "$UTT" ]] || exit 0
-cleanup() { rm -f "$UTT" "$WORK"/*.wav 2>/dev/null; rmdir "$WORK" 2>/dev/null; }
+# No engine or no model means nothing will EVER consume the spool, so the
+# no-op contract has to include discarding what was just spooled — otherwise
+# every hook firing accumulates in tmpfs, and the whole stale backlog gets
+# spoken in one burst the moment the engine appears.
+command -v "$ENGINE" >/dev/null || { rm -f "$SPOOL"/*.txt 2>/dev/null; exit 0; }
+[[ -f "$MODEL_DIR/model.int8.onnx" ]] || { rm -f "$SPOOL"/*.txt 2>/dev/null; exit 0; }
 
-# A new response supersedes whatever is still being read out.
-stop_playback
-
-command -v "$ENGINE" >/dev/null || { rm -f "$UTT"; exit 0; }
-[[ -f "$MODEL_DIR/model.int8.onnx" ]] || { rm -f "$UTT"; exit 0; }
-
-ps -o pgid= -p $$ | tr -d ' ' > "$PGID_FILE"
+# One utterance is spoken at a time. A drainer that finds the lock held bows
+# out immediately — no bash parked on flock for the length of a read-aloud.
+# That's safe because the HOLDER closes the handoff race: after its last look
+# finds the spool empty it releases the lock and looks once more, so an
+# utterance spooled in that window is picked up by the holder itself (or by
+# whichever new drainer beat it to the re-acquire).
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0
 
 WORK=$(mktemp -d "$RUN_DIR/speak.XXXXXX") || exit 0
+MYPGID=$(ps -o pgid= -p $$ | tr -d ' ')
+# Remove the pgid file only if it's still ours — once the lock is released a
+# newer drainer may have claimed it, and --stop needs THAT one's pgid.
+cleanup() {
+    rm -f "$WORK"/*.wav 2>/dev/null; rmdir "$WORK" 2>/dev/null
+    [[ "$(cat "$PGID_FILE" 2>/dev/null)" == "$MYPGID" ]] && rm -f "$PGID_FILE"
+    return 0
+}
 trap cleanup EXIT
 
-# Reduce markdown to speech and split it into sentence-sized chunks, one per
-# line. Chunking is what lets synthesis run ahead of playback.
-mapfile -t CHUNKS < <(MAX_CHARS="$MAX_CHARS" python3 - "$UTT" <<'PY'
+printf '%s\n' "$MYPGID" > "$PGID_FILE"
+
+# Drain in arrival order until the spool is empty. --stop empties the spool
+# before killing us, so an interrupted turn stops for good rather than resuming
+# with its next sentence.
+drain() {
+    local name
+    while :; do
+        name=$(ls -1 "$SPOOL" 2>/dev/null | sort | head -1)
+        [[ -n "$name" ]] || return 0
+        speak_file "$SPOOL/$name"
+        rm -f "$SPOOL/$name"
+    done
+}
+
+synth() { # synth(text, out.wav)
+    "$ENGINE" \
+        --kokoro-model="$MODEL_DIR/model.int8.onnx" \
+        --kokoro-voices="$MODEL_DIR/voices.bin" \
+        --kokoro-tokens="$MODEL_DIR/tokens.txt" \
+        --kokoro-data-dir="$MODEL_DIR/espeak-ng-data" \
+        --kokoro-length-scale="$LENGTH_SCALE" \
+        --sid="$SID" \
+        --num-threads=4 \
+        --output-filename="$2" \
+        "$1" >/dev/null 2>&1
+}
+
+# speak_file(path) — render one utterance and play it through.
+speak_file() {
+    local UTT="$1" i next synth_pid
+    local -a CHUNKS
+
+    # Reduce markdown to speech and split it into sentence-sized chunks, one per
+    # line. Chunking is what lets synthesis run ahead of playback.
+    mapfile -t CHUNKS < <(MAX_CHARS="$MAX_CHARS" python3 - "$UTT" <<'PY'
 import os, re, sys
 
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
@@ -213,39 +275,37 @@ if chunk:
 for c in out:
     print(c)
 PY
-)
+    )
 
-(( ${#CHUNKS[@]} )) || exit 0
+    (( ${#CHUNKS[@]} )) || return 0
 
-synth() { # synth(text, out.wav)
-    "$ENGINE" \
-        --kokoro-model="$MODEL_DIR/model.int8.onnx" \
-        --kokoro-voices="$MODEL_DIR/voices.bin" \
-        --kokoro-tokens="$MODEL_DIR/tokens.txt" \
-        --kokoro-data-dir="$MODEL_DIR/espeak-ng-data" \
-        --kokoro-length-scale="$LENGTH_SCALE" \
-        --sid="$SID" \
-        --num-threads=4 \
-        --output-filename="$2" \
-        "$1" >/dev/null 2>&1
+    # Synthesize chunk 0, then keep one chunk in flight ahead of the speaker:
+    # while chunk i plays, chunk i+1 renders. Time-to-first-word is one chunk.
+    synth "${CHUNKS[0]}" "$WORK/0.wav" || return 0
+    for (( i = 0; i < ${#CHUNKS[@]}; i++ )); do
+        next=$(( i + 1 ))
+        if (( next < ${#CHUNKS[@]} )); then
+            synth "${CHUNKS[$next]}" "$WORK/$next.wav" &
+            synth_pid=$!
+        else
+            synth_pid=""
+        fi
+
+        [[ -s "$WORK/$i.wav" ]] && play "$WORK/$i.wav"
+        rm -f "$WORK/$i.wav"
+
+        [[ -n "$synth_pid" ]] && wait "$synth_pid"
+    done
+    return 0
 }
 
-# Synthesize chunk 0, then keep one chunk in flight ahead of the speaker: while
-# chunk i plays, chunk i+1 renders. Time-to-first-word is one short chunk.
-synth "${CHUNKS[0]}" "$WORK/0.wav" || exit 0
-for (( i = 0; i < ${#CHUNKS[@]}; i++ )); do
-    next=$(( i + 1 ))
-    if (( next < ${#CHUNKS[@]} )); then
-        synth "${CHUNKS[$next]}" "$WORK/$next.wav" &
-        synth_pid=$!
-    else
-        synth_pid=""
-    fi
-
-    [[ -s "$WORK/$i.wav" ]] && play "$WORK/$i.wav"
-    rm -f "$WORK/$i.wav"
-
-    [[ -n "$synth_pid" ]] && wait "$synth_pid"
+# Drain, then close the handoff window: release the lock FIRST, then look at
+# the spool once more. An utterance that arrived during our last drain pass saw
+# the lock held and its drainer bowed out — with the lock now free, either we
+# re-acquire and drain it, or a newer drainer already has.
+while :; do
+    drain
+    flock -u 9
+    [[ -n "$(ls -A "$SPOOL" 2>/dev/null)" ]] || break
+    flock -n 9 || break
 done
-
-rm -f "$PGID_FILE"
