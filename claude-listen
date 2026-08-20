@@ -23,6 +23,10 @@
 #   "<callsign>, rename bravo to alpha"      retarget a name
 #   "<callsign>, reap"                       drop hand-closed panes
 #
+# The commands that aim at a name take it either side of the verb: "alpha,
+# focus" and "focus alpha" are the same, as are "come in" and "silence". The
+# closing commands are the exception — see the note on POSITION below.
+#
 # Only the focused instance is audible; opening the mic to one focuses it.
 # With no instances the callsign works exactly as it always has.
 #
@@ -30,7 +34,9 @@
 # word you choose you will eventually say. A standalone command must be the
 # *entire* utterance, so "then Skylark comes in" can never fire it, and the
 # closing commands must be the *final* words of a transmission. That also means
-# no escape hatch is needed: you can talk about the commands freely.
+# no escape hatch is needed: you can talk about the commands freely. It is also
+# why "out" and "disregard" are not reversible: they alone match at the end of
+# speech that carries content, so the leading name is doing real work there.
 #
 # Config: env vars, or ~/.config/claude-dictate/config (shared with the other
 # scripts):
@@ -117,6 +123,14 @@ declare -A MGMT=(
 # Only these may appear at the end of a real transmission; the rest are
 # standalone-only, which is what keeps them out of dictated prose.
 TERMINAL=(out disregard)
+# Prowords that read naturally either way round: "bravo, focus" and "focus
+# bravo" are the same instruction. Deliberately disjoint from TERMINAL — a
+# terminal proword matches at the END of an utterance carrying dictated
+# content, and the leading name is the only thing keeping "...pull the plug
+# out, bravo" in dictated prose from closing the mic. Reversing those would
+# throw that guard away; these are standalone-only, so they cannot fire
+# mid-transmission at all.
+DIRECTIONAL=(focus "come in" silence)
 
 # ------------------------------------------------------------------ grammar --
 
@@ -132,6 +146,13 @@ normalize() {
 # actually heard.
 canon_name() { printf '%s' "${NAME_OF[$1]:-$1}"; }
 
+# is_directional(proword) — may it be spoken verb-first?
+is_directional() {
+    local d
+    for d in "${DIRECTIONAL[@]}"; do [[ "$d" == "$1" ]] && return 0; done
+    return 1
+}
+
 # Echo "name<TAB>action[<TAB>arg[<TAB>arg]]" when the WHOLE utterance is a
 # command: "<name>, <proword>", or a management command on the callsign.
 # Anything else — a longer sentence that merely contains the phrase — is not
@@ -141,7 +162,12 @@ standalone_command() {
     for cs in "${!NAME_OF[@]}"; do
         name="${NAME_OF[$cs]}"
         for pw in "${!PROWORDS[@]}"; do
-            [[ "$n" == "$cs $pw" ]] || continue
+            if [[ "$n" != "$cs $pw" ]]; then
+                # Verb-first, for directional prowords only. The target is
+                # still guarded: $cs ranges over known spoken names, so
+                # "focus bravo" matches and "focus the parser" cannot.
+                is_directional "$pw" && [[ "$n" == "$pw $cs" ]] || continue
+            fi
             [[ "$pw" == focus && "$name" == "$CALLSIGN" ]] && continue
             printf '%s\t%s' "$name" "${PROWORDS[$pw]}"
             return 0
@@ -236,6 +262,7 @@ $c, radio check, to hear the current state. \
 Or $c, help, to hear this again. \
 With named instances up, the instance name takes the callsign's place: \
 alpha, come in. alpha, out. And alpha, focus, makes it the one you hear. \
+The name can go either side of the verb, so focus alpha works too. \
 Manage instances with $c, spawn. $c, list. $c, kill, then the name. \
 $c, rename, old name, to, new name. Or $c, reap, to drop dead ones. \
 A command only counts when it is the whole thing you said, so you can talk \
