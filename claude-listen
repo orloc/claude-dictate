@@ -10,7 +10,11 @@
 #   "... <callsign>, disregard"    throw it away
 #   "<callsign>, silence"          stop a reply being read aloud
 #   "<callsign>, radio check"      hear the current state
-#   "<callsign>, help"             hear the protocol
+#   "<callsign>, help"             hear the protocol — a menu, since the
+#                                  command set no longer fits one breath
+#   "<callsign>, help basics"      the pages behind it: dictation,
+#   "<callsign>, help instances"   name-addressed instances, and the
+#   "<callsign>, help management"  callsign-only management verbs
 #
 # With named instances up (see claude-roster), an instance's name takes the
 # callsign's place and the callsign becomes the management channel:
@@ -22,6 +26,7 @@
 #   "<callsign>, kill charlie"               kill an instance
 #   "<callsign>, rename bravo to alpha"      retarget a name
 #   "<callsign>, reap"                       drop hand-closed panes
+#   "<callsign>, status"                     same as radio check
 #
 # Only the focused instance is audible; opening the mic to one focuses it.
 # With no instances the callsign works exactly as it always has.
@@ -114,6 +119,23 @@ declare -A MGMT=(
     ["status"]=status
     ["reap"]=reap
 )
+# Help submenus. The top level is a menu; these are the pages. Spellings
+# whisper actually produces are folded in, same as the name aliases — an
+# unknown page is not a command at all, which keeps "$c, help me out here"
+# from firing anything.
+declare -A HELP_TOPICS=(
+    [basics]=basics [basic]=basics [dictation]=basics [protocol]=basics
+    [instances]=instances [instance]=instances [names]=instances
+    [management]=management [manage]=management [admin]=management
+)
+
+# canon_topic(spoken) — a known help page, or fail.
+canon_topic() {
+    local t="${HELP_TOPICS[$1]:-}"
+    [[ -n "$t" ]] || return 1
+    printf '%s' "$t"
+}
+
 # Only these may appear at the end of a real transmission; the rest are
 # standalone-only, which is what keeps them out of dictated prose.
 TERMINAL=(out disregard)
@@ -137,7 +159,7 @@ canon_name() { printf '%s' "${NAME_OF[$1]:-$1}"; }
 # Anything else — a longer sentence that merely contains the phrase — is not
 # a command.
 standalone_command() {
-    local n="$1" cs pw name rest
+    local n="$1" cs pw name rest topic
     for cs in "${!NAME_OF[@]}"; do
         name="${NAME_OF[$cs]}"
         for pw in "${!PROWORDS[@]}"; do
@@ -153,6 +175,11 @@ standalone_command() {
         # The two commands that take arguments. Still whole-utterance: a
         # prefix match here is only reached when the utterance STARTS with
         # the callsign, and the argument is everything after the verb.
+        if [[ "$n" == "$cs help "* ]]; then
+            topic=$(canon_topic "${n#"$cs help "}") || continue
+            printf '%s\thelp\t%s' "$name" "$topic"
+            return 0
+        fi
         if [[ "$n" == "$cs kill "* ]]; then
             printf '%s\tkill\t%s' "$name" "$(canon_name "${n#"$cs kill "}")"
             return 0
@@ -225,21 +252,68 @@ PY
 tone() { "$HERE/claude-speak" --play "$TONE_DIR/tone-$1.wav" 2>/dev/null & }
 speak() { printf '%s' "$1" | "$HERE/claude-speak"; }
 
+# Spoken, not printed. Three things follow from that and shape every line
+# below:
+#
+#   - You cannot skim audio. The old single block was 135 words — about a
+#     minute with no way to jump to the part you wanted. So help is a menu:
+#     the top level is the four things you need to talk at all, plus the
+#     names of the pages.
+#   - One clause per sentence. A period is the only reliable pause; commas
+#     inside a command ("rename, old name, to, new name") come out as a
+#     stutter, and a placeholder read aloud sounds like a word you should
+#     have said. Real names instead.
+#   - Say nothing about instances until instances exist. The top level asks
+#     the roster.
 help_text() {
-    local c="$CALLSIGN"
-    printf '%s' "Radio protocol. \
-To open the mic, say $c, come in. Then talk normally. \
+    local c="$CALLSIGN" page="${1:-}"
+    case "$page" in
+        basics)
+            printf '%s' "Basics. \
+To open the mic, say $c, come in. \
+Then talk normally. \
 To send what you said, finish with $c, out. \
 To throw it away instead, finish with $c, disregard. \
-While the mic is closed you can also say $c, silence, to stop me talking. \
-$c, radio check, to hear the current state. \
-Or $c, help, to hear this again. \
-With named instances up, the instance name takes the callsign's place: \
-alpha, come in. alpha, out. And alpha, focus, makes it the one you hear. \
-Manage instances with $c, spawn. $c, list. $c, kill, then the name. \
-$c, rename, old name, to, new name. Or $c, reap, to drop dead ones. \
-A command only counts when it is the whole thing you said, so you can talk \
-about these words without setting them off."
+While the mic is closed, say $c, silence, to stop me talking. \
+Say $c, radio check, to hear the current state. \
+A command only counts when it is the whole thing you said. \
+So you can talk about these words without setting them off."
+            ;;
+        instances)
+            printf '%s' "Instances. \
+When instances are up, the name goes where the callsign would. \
+Say alpha, come in. \
+Then alpha, out. \
+Say alpha, focus, to make alpha the one you hear. \
+Opening the mic to an instance focuses it too. \
+Only the focused instance is audible."
+            ;;
+        management)
+            printf '%s' "Management. \
+These all start with $c. \
+Say $c, spawn, for a new instance. \
+Say $c, list, to hear who is up. \
+Say $c, kill, then a name. \
+Say $c, rename bravo to alpha, to move a name. \
+Say $c, reap, to drop instances you closed by hand. \
+And $c, status, does the same as radio check."
+            ;;
+        *)
+            local out="Radio protocol. \
+To open the mic, say $c, come in. \
+Then talk normally. \
+To send it, finish with $c, out. \
+To throw it away, finish with $c, disregard."
+            if [[ -n "$(roster list 2>/dev/null)" ]]; then
+                out="$out An instance name works the same way. \
+Say alpha, come in. \
+And alpha, focus, makes alpha the one you hear."
+            fi
+            printf '%s' "$out For more, say $c, help, basics. \
+Or $c, help, instances. \
+Or $c, help, management."
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------- run --
@@ -404,7 +478,8 @@ handle() {
             hush)   "$HERE/claude-speak" --stop; tone ack
                     notify low 2000 "stopped speaking" ;;
             status) s=$(status_text); speak "$s"; notify low 3000 "$s" ;;
-            help)   speak "$(help_text)"; notify low 6000 "reading out the protocol" ;;
+            help)   speak "$(help_text "$a1")"
+                    notify low 6000 "reading out the protocol${a1:+: $a1}" ;;
             focus)  cmd_focus "$who" ;;
             spawn)  cmd_spawn ;;
             list)   s=$(list_text); speak "$s"; notify low 5000 "$s" ;;

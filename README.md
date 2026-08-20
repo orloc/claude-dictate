@@ -176,7 +176,18 @@ reaches Claude until you key up — a radio channel, not a dictaphone:
 "skylark, silence"            stop a reply being read aloud
 "skylark, radio check"        hear the current state
 "skylark, help"               hear the protocol, spoken
+"skylark, help basics"        the dictation commands, in detail
+"skylark, help instances"     addressing instances by name
+"skylark, help management"    spawn, list, kill, rename, reap, status
 ```
+
+Help is a menu rather than a monologue. Spoken, the full command set ran about
+a minute, and audio is the one medium you cannot skim — so `"skylark, help"`
+gives you the four commands you need to talk at all plus the names of the
+pages, and each page is a handful of short sentences. The top level asks the
+roster first: with nothing spawned it says nothing about instances. An
+unrecognized page is not a command at all, which is what keeps `"skylark, help
+me move this"` from firing anything.
 
 **Turning it on and off.** The listener is a background process you toggle,
 not something that runs forever:

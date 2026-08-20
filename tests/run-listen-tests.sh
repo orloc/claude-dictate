@@ -50,6 +50,12 @@ eq "help is recognized"            "$(try_standalone 'skylark help')"         $'
 eq "radio check is recognized"     "$(try_standalone 'Skylark, radio check')" $'skylark\tstatus'
 eq "silence is recognized"         "$(try_standalone 'skylark silence')"      $'skylark\thush'
 eq "an alias spelling still works" "$(try_standalone 'Sky lark, come in')"    $'skylark\topen'
+eq "help takes a page"             "$(try_standalone 'skylark help basics')"   $'skylark\thelp\tbasics'
+eq "a page alias resolves"         "$(try_standalone 'Skylark, help, manage')" $'skylark\thelp\tmanagement'
+# The page must be known, or the prefix match becomes a way for ordinary
+# speech starting with the callsign to fire a command.
+eq "an unknown page is not a command" "$(try_standalone 'skylark help me move this')" "(none)"
+eq "bare help still works"            "$(try_standalone 'skylark help')"          $'skylark\thelp'
 
 # The whole-utterance rule is the thing that makes the protocol safe: these are
 # all sentences a person says while describing the system.
@@ -175,6 +181,46 @@ if grep -qF "To open the mic" <<<"$SPOKEN"; then ok "help speaks the protocol"
 else no "help speaks the protocol" "spoke: $SPOKEN"; fi
 if grep -qF "$CALLSIGN" <<<"$SPOKEN"; then ok "help names the configured callsign"
 else no "help names the configured callsign" "spoke: $SPOKEN"; fi
+
+# --- help pages -------------------------------------------------------------
+echo "# help pages"
+
+# Every command in the tables has to be reachable from some page, or the
+# protocol grows a verb nobody can be told about. This is the check that
+# catches the next one added without a help line.
+help_corpus="$(help_text)$(help_text basics)$(help_text instances)$(help_text management)"
+missing=""
+for verb in "${!PROWORDS[@]}" "${!MGMT[@]}" kill rename; do
+    grep -qiF "$verb" <<<"$help_corpus" || missing="$missing $verb"
+done
+if [[ -z "$missing" ]]; then ok "every command appears on some help page"
+else no "every command appears on some help page" "undocumented:$missing"; fi
+
+# The point of paging is that no single page is a monologue.
+for page in "" basics instances management; do
+    words=$(help_text "$page" | wc -w)
+    if (( words <= 80 )); then ok "help page '${page:-top}' stays short ($words words)"
+    else no "help page '${page:-top}' stays short" "$words words"; fi
+done
+
+# Top level must not describe instances that do not exist.
+# Drive the harness's fake through FAKE_ROSTER rather than redefining
+# roster() — replacing it here would leave every later test talking to the
+# real one. Both are restored, since ROSTER_CALLS is asserted downstream.
+_saved_roster="$FAKE_ROSTER"; _saved_calls="$ROSTER_CALLS"
+FAKE_ROSTER=""
+if ! grep -qF "alpha" <<<"$(help_text)"; then ok "top level omits instances when none are up"
+else no "top level omits instances when none are up" "$(help_text)"; fi
+FAKE_ROSTER=$'alpha\t%0\tfocused'
+if grep -qF "alpha, focus" <<<"$(help_text)"; then ok "top level mentions instances when they are up"
+else no "top level mentions instances when they are up" "$(help_text)"; fi
+FAKE_ROSTER="$_saved_roster"; ROSTER_CALLS="$_saved_calls"
+
+say "skylark help management"
+eq "a help page stays in standby"      "$STATE"  "standby"
+eq "a help page dictates nothing"      "$SENT"   ""
+if grep -qF "spawn" <<<"$SPOKEN"; then ok "the management page speaks the management verbs"
+else no "the management page speaks the management verbs" "spoke: $SPOKEN"; fi
 
 # a command word said while transmitting is dictation, not a command
 STATE=standby; BUFFER=""; SENT=""; SPOKEN=""
