@@ -91,6 +91,28 @@ eq "kill inside prose does not fire" "$(try_standalone 'and then skylark kill ch
 eq "instance name alone does not fire" "$(try_standalone 'alpha')"                      "(none)"
 eq "instance phrase with a suffix does not fire" "$(try_standalone 'alpha come in here')" "(none)"
 
+# --- verb-first word order ---------------------------------------------------
+echo "# verb-first word order"
+# A directional proword takes its target on either side. The target is still
+# required, and still has to be a name.
+eq "focus takes the name first"      "$(try_standalone 'focus bravo')"         $'bravo\tfocus'
+eq "focus takes the name last"       "$(try_standalone 'bravo focus')"         $'bravo\tfocus'
+eq "verb-first resolves an alias"    "$(try_standalone 'Focus Charley.')"      $'charlie\tfocus'
+eq "come in reverses too"            "$(try_standalone 'come in alpha')"       $'alpha\topen'
+eq "silence reverses too"            "$(try_standalone 'silence alpha')"       $'alpha\thush'
+eq "verb-first needs a real name"    "$(try_standalone 'focus the parser')"    "(none)"
+eq "verb-first needs any name"       "$(try_standalone 'focus')"               "(none)"
+eq "verb-first rejects an unknown name" "$(try_standalone 'focus seagull')"    "(none)"
+eq "verb-first does not fire in prose" "$(try_standalone 'we should focus alpha first')" "(none)"
+eq "verb-first focus on the callsign is still not a command" \
+                                     "$(try_standalone 'focus skylark')"       "(none)"
+# Management verbs keep their fixed shape — they are not directional.
+eq "verb-first does not reach spawn" "$(try_standalone 'spawn skylark')"       "(none)"
+eq "verb-first does not reach list"  "$(try_standalone 'list skylark')"        "(none)"
+# The closing commands stay one-way, which is what keeps them out of prose.
+eq "out does not reverse"            "$(try_standalone 'out bravo')"           "(none)"
+eq "disregard does not reverse"      "$(try_standalone 'disregard bravo')"     "(none)"
+
 # --- terminal commands ------------------------------------------------------
 echo "# terminal commands"
 try_terminal() { terminal_command "$(normalize <<<"$1")" || printf '(none)'; }

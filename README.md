@@ -181,6 +181,13 @@ reaches Claude until you key up — a radio channel, not a dictaphone:
 "skylark, help management"    spawn, list, kill, rename, reap, status
 ```
 
+The commands that aim at a name take it on either side of the verb — `"focus
+bravo"` and `"bravo, focus"` are the same instruction, as are `come in` and
+`silence`. The two closing commands are deliberately one-way: `out` and
+`disregard` are the only prowords that match at the *end* of speech carrying
+dictated content, so the leading name is what stops a sentence trailing off in
+"...out" from sending your transmission.
+
 Help is a menu rather than a monologue. Spoken, the full command set ran about
 a minute, and audio is the one medium you cannot skim — so `"skylark, help"`
 gives you the four commands you need to talk at all plus the names of the
