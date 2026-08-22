@@ -264,6 +264,26 @@ check_timeout
 eq "timeout closes the mic"  "$STATE" "standby"
 eq "timeout sends the buffer" "$SENT" "a long thought"
 
+# The ceiling has to be reached on the path where speech IS arriving. A room
+# that keeps talking never goes quiet, so a guard evaluated only during
+# silence is a guard that never runs — which is how a phone call ended up
+# dictated. pump() is the pairing; drive it the way the read loop does.
+pumped() { NEXT_TEXT="$1"; pump "$SANDBOX/nonexistent.wav"; }
+
+STATE=transmitting; BUFFER=""; SENT=""; TX_TARGET=skylark
+TX_START=$SECONDS; MAX_TX=0
+pumped "and then the parser reads the header"
+eq "continuous speech still hits the ceiling" "$STATE" "standby"
+eq "the ceiling sends what it had"            "$SENT"  "and then the parser reads the header"
+
+# ...and an utterance arriving well inside the window must not trip it.
+STATE=transmitting; BUFFER=""; SENT=""; TX_TARGET=skylark
+TX_START=$SECONDS; MAX_TX=900
+pumped "still mid sentence here"
+eq "speech inside the window keeps the mic open" "$STATE" "transmitting"
+eq "speech inside the window sends nothing"      "$SENT"  ""
+MAX_TX=90
+
 # --- named instances ----------------------------------------------------------
 echo "# named instances"
 # With a roster up, the instance name is the callsign and the callsign is

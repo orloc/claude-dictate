@@ -55,7 +55,10 @@
 #   LISTEN_POOL_ALIASES  name:alias,alias;name:alias — whisper misspellings
 #                      per pool name (defaults built in)
 #   LISTEN_MAX_TX      seconds before an unclosed transmission sends itself
-#                      (default: 90)
+#                      (default: 30 — this is a blast radius, not a
+#                      convenience. Whatever is audible when you forget to
+#                      say "out" gets dictated, so the number should be the
+#                      most room audio you are willing to send.)
 #   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
 #   LISTEN_CLOSE_MS    silence that ends an utterance (700)
 #
@@ -83,7 +86,7 @@ CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
 ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark;scarlett;scarlet;skylarke;sky lock;skylab;sly lark}"
 POOL="${LISTEN_POOL:-alpha bravo charlie delta echo foxtrot}"
 POOL_ALIASES="${LISTEN_POOL_ALIASES:-alpha:alfa;bravo:brava,brovo;charlie:charley,charly;echo:eco,ecko;foxtrot:fox trot,foxtrott,fox trott}"
-MAX_TX="${LISTEN_MAX_TX:-90}"
+MAX_TX="${LISTEN_MAX_TX:-30}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
 ROSTER_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/roster"
@@ -546,6 +549,17 @@ handle() {
     notify low 90000 "🔴 $BUFFER"
 }
 
+# One utterance's worth of work. handle() and check_timeout() belong on the
+# same path and in this order: the ceiling exists for a transmission nobody
+# closed, and speech arriving is exactly the condition under which that
+# happens. Checking it only when the room falls quiet — which is what the
+# read loop used to do — leaves a conversation or a speakerphone free to
+# hold the channel open indefinitely.
+pump() {
+    handle "$1"
+    check_timeout
+}
+
 # A missed "out" would otherwise hold the channel open forever, so a long
 # transmission closes and sends itself rather than being lost.
 check_timeout() {
@@ -679,7 +693,7 @@ run_listener() {
     local wav st
     while true; do
         if read -r -t 5 wav <&3; then
-            [[ -f "$wav" ]] && handle "$wav"
+            [[ -f "$wav" ]] && pump "$wav"
         else
             st=$?
             if (( st > 128 )); then
