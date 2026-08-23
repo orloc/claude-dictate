@@ -180,7 +180,15 @@ argv=$(PATH="$FB:/usr/bin:/bin" bash -c '
     sed "s|exec pw-record|exec echo-record|" "'"$SCRIPT"'" > "'"$SANDBOX"'/mic-exec"
     bash "'"$SANDBOX"'/mic-exec" --record --rate 16000 --channels 1 --format s16 -')
 eq "--record targets the live device and passes the rest through" \
-   "$argv" "ARGV: --target $CABLE --rate 16000 --channels 1 --format s16 -"
+   "$argv" "ARGV: --target $CABLE -P { node.dont-reconnect = true } --rate 16000 --channels 1 --format s16 -"
+
+# The property is the whole reason a wrong device gets noticed. Without it a
+# vanished node does not end the stream — PipeWire moves it to the default
+# source, and a stream that is alive, real-time and non-zero looks perfect from
+# every angle while carrying nothing. Assert it explicitly, because the symptom
+# if it silently disappears is a mic that lies rather than one that fails.
+if grep -qF "node.dont-reconnect = true" <<<"$argv"; then ok "the recorder refuses to be relinked"
+else no "the recorder refuses to be relinked" "$argv"; fi
 
 echo
 echo "passed: $pass  failed: $fail"

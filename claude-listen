@@ -66,6 +66,9 @@
 #   LISTEN_CLOSE_MS    silence that ends an utterance (700)
 #   LISTEN_DEAD_MS     digitally silent capture that means the device is gone
 #                      and the mic should be resolved again (20000)
+#   LISTEN_IDLE_RECHECK  seconds of hearing nothing at all after which the mic
+#                      is resolved again from scratch, in case the stream is
+#                      alive but attached to the wrong device (600, 0 disables)
 #
 # Reuses DICTATE_WHISPER / DICTATE_MODEL / DICTATE_RECORDER / DICTATE_TARGET;
 # claude-roster adds DICTATE_SPAWN_CMD for what a spawned pane runs.
@@ -96,6 +99,7 @@ MAX_TX_TOTAL="${LISTEN_MAX_TX_TOTAL:-900}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
 DEAD_MS="${LISTEN_DEAD_MS:-20000}"
+IDLE_RECHECK="${LISTEN_IDLE_RECHECK:-600}"
 ROSTER_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/roster"
 
 # One spoken-form → canonical-name map covering the callsign and every pool
@@ -259,20 +263,24 @@ terminal_command() {
 # The stamp, rather than "does tone-open.wav exist": these are generated once
 # and then cached forever, so a change to how they sound would never reach
 # anyone who had already run an older version. Bump it when the tones change.
-TONE_STAMP=2
+TONE_STAMP=3
 
 make_tones() {
     [[ -f "$TONE_DIR/.generated-$TONE_STAMP" ]] && return 0
     mkdir -p "$TONE_DIR"
     python3 - "$TONE_DIR" <<'PY'
 import math, struct, sys, wave
-RATE = 16000
-# Every tone opens with silence. A USB sink suspends when idle, and resuming it
-# costs a few hundred milliseconds during which samples go nowhere — long
-# enough to swallow a 160 ms beep whole, which is exactly what a state tone is.
-# The device then wakes on the padding and the beep itself lands on a running
-# device. It costs nothing: silence is not audible latency.
-LEAD_MS = 240
+# 48 kHz because that is what these sinks run at, and half a second of silence
+# in front of every tone because a USB sink suspends when idle and takes a few
+# hundred milliseconds to resume — during which samples go nowhere. A state tone
+# is 160 ms long, so it was being swallowed whole.
+#
+# Both numbers are from an A/B against a live headset, not from theory: the same
+# two-note beep was inaudible at 16 kHz with 240 ms of lead-in and audible at
+# 48 kHz with 500 ms, played to the same sink seconds apart. Matching the sink's
+# rate also keeps a resampler out of a path that has to work from cold.
+RATE = 48000
+LEAD_MS = 500
 
 def tone(path, steps):
     frames = bytearray(2 * (RATE * LEAD_MS // 1000))
@@ -758,7 +766,7 @@ run_listener() {
     # $RECORDER is a word-split command by design (same contract as
     # claude-dictate); "-" makes pw-record stream to stdout.
     open_stream
-    local stream_up=$SECONDS backoff=1 dead_streak=0
+    local stream_up=$SECONDS backoff=1 dead_streak=0 last_heard=$SECONDS
 
     # Read utterances as they close, with a periodic tick so the transmission
     # timeout still fires while nobody is saying anything.
@@ -794,12 +802,30 @@ run_listener() {
                 # Audio again: whatever we switched to is carrying sound, so the
                 # next silence is a fresh event and gets told about.
                 dead_streak=0
+                last_heard=$SECONDS
                 pump "$wav"
             fi
         else
             st=$?
             if (( st > 128 )); then
                 check_timeout
+                # The belt for a stream that is alive, non-zero, and wrong. A
+                # node that disappears should now end the recorder outright
+                # (claude-mic asks for node.dont-reconnect), but PipeWire moving
+                # a capture stream to some other device is invisible from here:
+                # a wrong device and a quiet room produce exactly the same
+                # nothing. So after long enough of hearing NOTHING, stop
+                # trusting the stream and resolve the mic from scratch. A quiet
+                # room pays a second of rebuilding; a wrong device gets fixed.
+                if (( IDLE_RECHECK > 0 && SECONDS - last_heard >= IDLE_RECHECK )) \
+                   && [[ "$STATE" == standby ]]; then
+                    log "nothing heard in ${IDLE_RECHECK}s — re-resolving the mic"
+                    [[ -x "$HERE/claude-mic" ]] && "$HERE/claude-mic" --forget 8>&-
+                    close_stream
+                    open_stream
+                    stream_up=$SECONDS
+                    last_heard=$SECONDS
+                fi
             else
                 # The capture stream ended — headset asleep, device
                 # reconfigured, recorder killed. Rebuild rather than exit: a

@@ -143,7 +143,18 @@ case "${1:-}" in
         # died on arrival and retries with a backoff. Waiting out the gap is
         # cheaper than the retry, and only the measuring path pays it.
         (( measured )) && sleep 0.2
-        exec pw-record --target "$src" "$@"
+        # node.dont-reconnect is the difference between a mic that fails and a
+        # mic that lies. Without it, a target node that goes away — a headset
+        # replugged, a device re-enumerated — does not kill the stream:
+        # PipeWire relinks it to the default source, which here is an S/PDIF
+        # input carrying nothing. Bytes then arrive at exactly real time and
+        # are not zeros, so neither a stalled-stream check nor a digital-silence
+        # check can see anything wrong, and the listener transcribes an empty
+        # wire indefinitely. Measured that way for thirteen minutes: the stream
+        # was healthy, and attached to Source 57 instead of the headset.
+        # With this, the node's disappearance ends the recorder, the caller
+        # rebuilds, and resolution runs again on whatever is live now.
+        exec pw-record --target "$src" -P '{ node.dont-reconnect = true }' "$@"
         ;;
     --forget)
         rm -f "$CACHE" "$CACHE_KEY"
