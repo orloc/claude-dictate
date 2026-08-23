@@ -55,6 +55,15 @@ printf '$p %s\n' "\$*" >> "\$PLAYED_LOG"
 exit 0
 EOF
 done
+# Sink list stand-in: the two cards one wireless headset presents — its dongle
+# and its own USB audio over the charging cable.
+{
+    echo '#!/bin/sh'
+    echo '[ "$1 $2 $3" = "list short sinks" ] || exit 0'
+    echo 'printf "50\talsa_output.usb-Corsair_HS35_v3_Wireless_Gaming_Headset_0123456789AB-01.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\tSUSPENDED\n"'
+    echo 'printf "51\talsa_output.usb-Corsair_HS35_v3_WL_0123456789AB-01.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\tSUSPENDED\n"'
+} > "$FAKEBIN/pactl"
+
 chmod +x "$FAKEBIN"/*
 
 # ------------------------------------------------------------------ harness -
@@ -71,6 +80,12 @@ say() {
     local text="$1"; shift
     : > "$SPOKEN"; : > "$PLAYED"
     rm -rf "${RUNTIME:?}/claude-dictate"
+    # claude-mic's published answer lives in the runtime dir the wipe just
+    # removed, so a case that needs one seeds it here rather than before.
+    if [[ -n "${PUBLISHED_MIC:-}" ]]; then
+        mkdir -p "$RUNTIME/claude-dictate"
+        printf '%s' "$PUBLISHED_MIC" > "$RUNTIME/claude-dictate/mic"
+    fi
     printf '%s' "$text" | env -i \
         PATH="$FAKEBIN:/usr/bin:/bin" \
         HOME="$SANDBOX" \
@@ -183,6 +198,18 @@ say 'Follow the mic.' DICTATE_RECORDER="pw-record --target alsa_input.usb-Nope_F
 out=$(cat "$PLAYED")
 hasnt "an unmatchable mic card falls back to the default device" "$out" "--target alsa_output"
 
+# A headset that moves between its dongle and its cable is two different cards,
+# so the device to answer through cannot be baked into a config. claude-mic
+# publishes whichever one is live, and that has to outrank the recorder command
+# — which, once the recorder asks claude-mic for a device, names none at all.
+CABLE_SRC=alsa_input.usb-Corsair_HS35_v3_Wireless_Gaming_Headset_0123456789AB-01.mono-fallback
+CABLE_SINK=alsa_output.usb-Corsair_HS35_v3_Wireless_Gaming_Headset_0123456789AB-01.analog-stereo
+PUBLISHED_MIC="$CABLE_SRC" say 'Follow the live mic.' \
+    DICTATE_RECORDER="pw-record --target alsa_input.usb-Corsair_HS35_v3_WL_0123456789AB-01.mono-fallback" >/dev/null
+out=$(cat "$PLAYED")
+has "the published mic picks the sink on its own card" "$out" "--target $CABLE_SINK"
+hasnt "a stale pinned mic does not win"                "$out" "HS35_v3_WL_0123456789AB-01.analog-stereo"
+
 # --- stop -------------------------------------------------------------------
 env -i PATH="$FAKEBIN:/usr/bin:/bin" HOME="$SANDBOX" \
     XDG_RUNTIME_DIR="$RUNTIME" XDG_CONFIG_HOME="$CONFHOME" \
@@ -197,6 +224,7 @@ env -i PATH="$FAKEBIN:/usr/bin:/bin" HOME="$SANDBOX" \
     XDG_RUNTIME_DIR="$RUNTIME" XDG_CONFIG_HOME="$CONFHOME" \
     bash "$SCRIPT" --stop >/dev/null 2>&1
 check "--stop tolerates a garbage pgid file" "$?" "0"
+
 
 echo
 echo "passed: $pass  failed: $fail"

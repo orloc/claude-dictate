@@ -50,7 +50,18 @@ ENABLED="${SPEAK_ENABLED:-1}"
 # default sink happens to be. The capture and playback nodes of one card share
 # a name stem — alsa_input.<stem>.<profile> / alsa_output.<stem>.<profile> — so
 # the mic the recorder is pinned to names the sink to answer through.
+# claude-mic publishes the source it resolved, and that file wins over anything
+# parsed out of the recorder command. It has to: once the recorder stops naming
+# a device and asks claude-mic for one instead, the command string holds no
+# --target to read, and a headset that moves between its dongle and its cable
+# changes which card is live without any config changing at all. The parse
+# stays for a recorder that still pins a name by hand.
 recorder_target() {
+    local published="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/mic"
+    if [[ -s "$published" ]]; then
+        printf '%s' "$(cat "$published")"
+        return 0
+    fi
     local prev="" w
     for w in ${DICTATE_RECORDER:-}; do
         [[ "$prev" == "--target" ]] && { printf '%s' "$w"; return 0; }

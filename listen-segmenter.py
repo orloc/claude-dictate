@@ -16,6 +16,11 @@ ambient noise is re-learned in seconds instead of holding the mic open.
 Hysteresis matters as much as the threshold. Opening needs several consecutive
 loud frames so a keyboard clack can't start an utterance, and closing needs a
 long run of quiet so a pause for breath mid-sentence doesn't split it in two.
+
+One line that is not a wav path: "!dead", printed when the stream has been
+EXACTLY zero for --dead-ms, at which point this exits. A capture device whose
+hardware has gone away keeps streaming perfect silence instead of failing, and
+the caller can only tell that from a quiet room here, where the samples are.
 """
 
 import argparse
@@ -90,12 +95,17 @@ def main():
                     help="hard cap on one utterance, so a stuck-open mic ends")
     ap.add_argument("--min-ms", type=int, default=300,
                     help="drop utterances shorter than this as noise")
+    ap.add_argument("--dead-ms", type=int, default=20000,
+                    help="digital silence this long prints !dead and exits")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     close_frames = max(1, args.close_ms // FRAME_MS)
     max_frames = max(1, args.max_ms // FRAME_MS)
     min_frames = max(1, args.min_ms // FRAME_MS)
+
+    dead_frames = max(1, args.dead_ms // FRAME_MS)
+    zero_run = 0
 
     floor = -60.0          # rolling noise-floor estimate, seeded pessimistically
     loud_run = 0
@@ -117,6 +127,20 @@ def main():
         frame = array.array("h")
         frame.frombytes(raw)
         level = dbfs(frame)
+
+        # A capture device that has lost its hardware does not fail — it streams
+        # perfect zeros, which is indistinguishable from a quiet room to every
+        # threshold below. It is distinguishable here: a live converter's
+        # quietest room still has noise in the last bit, so a long run of
+        # EXACTLY zero samples means the audio is coming from nowhere. Say so
+        # and stop, rather than listening to a dead wire for hours.
+        if any(frame):
+            zero_run = 0
+        else:
+            zero_run += 1
+            if zero_run >= dead_frames:
+                print("!dead", flush=True)
+                return
 
         loud = level > floor + args.margin_db
 

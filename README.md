@@ -268,6 +268,53 @@ floor only learns from quiet frames, so a long sentence can't drag it up over
 itself. `LISTEN_MARGIN_DB` and `LISTEN_CLOSE_MS` are the knobs if it clips your
 first word or splits sentences at pauses.
 
+### Which mic
+
+A headset is often more than one audio device. A wireless one is usually two:
+the dongle is a card, and the headset's own USB audio is a second card that
+appears the moment you plug the charging cable in. Which one carries your voice
+depends on how it's connected right now.
+
+The trap is that the losing device doesn't fail. A dongle with no headset behind
+it stays enumerated and streams perfect digital silence, so a config pinned to
+it goes quietly deaf rather than erroring — and a mic recording nothing looks
+exactly like a room where nobody is talking. Whisper obligingly fills the gap by
+hallucinating "Thank you" onto the silence, which is what a dead mic looks like
+in the log.
+
+So `claude-mic` picks the device by measurement, not by name:
+
+```sh
+claude-mic --show      # what each candidate measured, and the answer
+claude-mic --resolve    # just the answer
+```
+
+It records a moment from each candidate and takes the first whose samples
+aren't all zero — a live converter's quietest room still has noise in the last
+bit, so no threshold needs tuning. Point `DICTATE_RECORDER` at it and the
+device is chosen afresh every time recording starts:
+
+```sh
+DICTATE_MIC_MATCH="Corsair"
+DICTATE_RECORDER="$HOME/dev/claude-dictate/claude-mic --record --rate 16000 --channels 1 --format s16"
+```
+
+`DICTATE_MIC_MATCH` matters more than it looks: without it the first *live*
+source wins, and an S/PDIF input carrying nothing still reads as live, since an
+unlocked receiver emits non-zero dither. Name the card you mean.
+
+The answer is cached, keyed on the candidate list itself — so the hotkey path
+pays nothing (a probe before the mic opens would clip your first word), while
+plugging a cable in or pulling a dongle out invalidates it, because that is
+exactly when the answer changes. `claude-mic` publishes what it picked, and
+`claude-speak` reads it to choose the sink on the same card: replies come out
+of the headset you're talking into, wherever that is this minute.
+
+Switching mid-session heals itself. The segmenter reports a stream that has
+been exactly zero for `LISTEN_DEAD_MS`, and the listener drops the cached
+device and rebuilds on whatever is live now — the only place that distinction
+can be made is where the samples are.
+
 The honest caveat: this means something is always listening on your mic.
 Everything stays on the machine — whisper is local and nothing is transmitted
 unless it's a command or a dictated message — but "always on" is a real change
@@ -298,6 +345,9 @@ scripts read the same file):
 | `LISTEN_MAX_TX_TOTAL` | `900` | hard ceiling on one transmission, `0` disables |
 | `LISTEN_MARGIN_DB` | `12` | dB above the noise floor that counts as speech |
 | `LISTEN_CLOSE_MS` | `700` | silence that ends an utterance |
+| `LISTEN_DEAD_MS` | `20000` | digitally silent capture that means the device is gone |
+| `DICTATE_MIC_MATCH` | any capture source | extended regex `claude-mic` requires of a source name |
+| `DICTATE_MIC_PROBE_MS` | `400` | how long `claude-mic` samples each candidate |
 
 ## Notes / quirks
 
@@ -343,6 +393,12 @@ no microphone, and so the tests can assert what was *not* done: that ordinary
 speech never dictates, that near-miss sentences never fire a command, and that
 help never reaches the dictation path. The singleton tests run real background
 instances on fake binaries.
+
+`./tests/run-mic-tests.sh` — device resolution against fake `pactl` and
+`pw-record`, so a headset can be plugged, unplugged and moved between its
+dongle and its cable with no audio hardware in the room. The fakes carry the
+distinction the real bug turned on: `FAKE_SOURCES` is what gets *listed*,
+`FAKE_LIVE` is what actually carries sound, and the losing device stays listed.
 
 `./tests/run-hook-tests.sh` — the speak hook end to end: payloads in, spoken
 text and `--stop` calls out, with a fake tmux deciding which session the hook

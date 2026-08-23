@@ -64,6 +64,8 @@
 #                      a room that never falls quiet
 #   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
 #   LISTEN_CLOSE_MS    silence that ends an utterance (700)
+#   LISTEN_DEAD_MS     digitally silent capture that means the device is gone
+#                      and the mic should be resolved again (20000)
 #
 # Reuses DICTATE_WHISPER / DICTATE_MODEL / DICTATE_RECORDER / DICTATE_TARGET;
 # claude-roster adds DICTATE_SPAWN_CMD for what a spawned pane runs.
@@ -93,6 +95,7 @@ MAX_TX="${LISTEN_MAX_TX:-30}"
 MAX_TX_TOTAL="${LISTEN_MAX_TX_TOTAL:-900}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
+DEAD_MS="${LISTEN_DEAD_MS:-20000}"
 ROSTER_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/roster"
 
 # One spoken-form → canonical-name map covering the callsign and every pool
@@ -253,14 +256,26 @@ terminal_command() {
 
 # Short distinct tones rather than spoken confirmations: you hear these dozens
 # of times an hour and you're not looking at the screen.
+# The stamp, rather than "does tone-open.wav exist": these are generated once
+# and then cached forever, so a change to how they sound would never reach
+# anyone who had already run an older version. Bump it when the tones change.
+TONE_STAMP=2
+
 make_tones() {
-    [[ -f "$TONE_DIR/tone-open.wav" ]] && return 0
+    [[ -f "$TONE_DIR/.generated-$TONE_STAMP" ]] && return 0
     mkdir -p "$TONE_DIR"
     python3 - "$TONE_DIR" <<'PY'
 import math, struct, sys, wave
 RATE = 16000
+# Every tone opens with silence. A USB sink suspends when idle, and resuming it
+# costs a few hundred milliseconds during which samples go nowhere — long
+# enough to swallow a 160 ms beep whole, which is exactly what a state tone is.
+# The device then wakes on the padding and the beep itself lands on a running
+# device. It costs nothing: silence is not audible latency.
+LEAD_MS = 240
+
 def tone(path, steps):
-    frames = bytearray()
+    frames = bytearray(2 * (RATE * LEAD_MS // 1000))
     for freq, ms, amp in steps:
         n = RATE * ms // 1000
         for i in range(n):
@@ -280,6 +295,7 @@ tone(f"{d}/tone-err.wav",   [(200, 180, .30)])
 tone(f"{d}/tone-on.wav",    [(520, 60, .30), (660, 60, .30), (880, 90, .30)])
 tone(f"{d}/tone-off.wav",   [(880, 60, .30), (660, 60, .30), (440, 110, .30)])
 PY
+    : > "$TONE_DIR/.generated-$TONE_STAMP"
 }
 
 # Every child of the listener is spawned with 8>&-. Fd 8 is the singleton
@@ -368,6 +384,20 @@ TX_LAST=0        # when the open transmission last heard a word (see check_timeo
 TX_TARGET=""     # canonical name the open transmission belongs to
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
+
+# A sleep that SIGTERM can cut short. `sleep` is an external command, and bash
+# defers a trapped signal until the foreground child exits — so waiting out a
+# backoff with a plain sleep makes --stop look broken for as long as the wait,
+# and the listener holds its singleton lock the whole time. `wait` is a builtin,
+# and a builtin returns the moment the signal lands, so the EXIT trap runs then
+# rather than up to a minute later.
+nap() {
+    local pid
+    sleep "$1" & pid=$!
+    wait "$pid" 2>/dev/null
+    kill "$pid" 2>/dev/null
+    return 0
+}
 
 transcribe() {
     "$WHISPER" -m "$MODEL" -f "$1" --no-prints --no-timestamps --suppress-nst \
@@ -682,7 +712,8 @@ open_stream() {
     # running" against a corpse.
     exec 3< <($RECORDER - 2>/dev/null 8>&- \
         | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
-              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS" 8>&-)
+              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS" \
+              --dead-ms "$DEAD_MS" 8>&-)
 }
 
 close_stream() {
@@ -727,14 +758,44 @@ run_listener() {
     # $RECORDER is a word-split command by design (same contract as
     # claude-dictate); "-" makes pw-record stream to stdout.
     open_stream
-    local stream_up=$SECONDS backoff=1
+    local stream_up=$SECONDS backoff=1 dead_streak=0
 
     # Read utterances as they close, with a periodic tick so the transmission
     # timeout still fires while nobody is saying anything.
     local wav st
     while true; do
         if read -r -t 5 wav <&3; then
-            [[ -f "$wav" ]] && pump "$wav"
+            # The segmenter's one non-path line. The device is enumerated and
+            # streaming, so nothing errored and nothing will — it is simply
+            # sending zeros, because the headset moved to its other card or
+            # went to sleep. Drop the resolved mic and rebuild: claude-mic
+            # measures again, and the stream comes back on whichever device is
+            # actually live. Nothing else can notice this; a silent mic and a
+            # silent room are the same thing to every threshold we have.
+            if [[ "$wav" == "!dead" ]]; then
+                dead_streak=$(( dead_streak + 1 ))
+                log "capture is digital silence — re-resolving the mic (attempt $dead_streak)"
+                # Only the first one is worth interrupting you for. A headset
+                # that is simply switched off is silent on every device, so the
+                # streak would otherwise post a critical notification every
+                # dead-ms until you noticed the thing you already know.
+                (( dead_streak == 1 )) && notify critical 4000 "mic went silent — switching device"
+                [[ -x "$HERE/claude-mic" ]] && "$HERE/claude-mic" --forget 8>&-
+                close_stream
+                # Switching devices should be instant, but a mic that is silent
+                # because nothing is turned on will be silent again next time —
+                # so a repeat backs off instead of probing in a loop forever.
+                (( dead_streak > 1 )) && nap $(( dead_streak > 6 ? 30 : 5 ))
+                open_stream
+                stream_up=$SECONDS
+                continue
+            fi
+            if [[ -f "$wav" ]]; then
+                # Audio again: whatever we switched to is carrying sound, so the
+                # next silence is a fresh event and gets told about.
+                dead_streak=0
+                pump "$wav"
+            fi
         else
             st=$?
             if (( st > 128 )); then
@@ -755,7 +816,7 @@ run_listener() {
                     (( backoff == 60 )) && notify critical 5000 "mic unavailable — still retrying"
                 fi
                 close_stream
-                sleep "$backoff"
+                nap "$backoff"
                 open_stream
                 stream_up=$SECONDS
             fi

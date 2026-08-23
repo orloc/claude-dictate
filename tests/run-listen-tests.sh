@@ -466,7 +466,9 @@ printf '#!/bin/sh\nexit 0\n' > "$FB/fake-whisper"
 # Streams like the real recorder, so it dies of SIGPIPE when its segmenter is
 # killed instead of lingering as an orphan the suite has to hunt down.
 printf '#!/bin/sh\nexec cat /dev/zero\n' > "$FB/fake-recorder"
-printf '#!/bin/sh\nexit 0\n' > "$FB/notify-send"
+# Records what it was asked to show, so a test can assert on the popups a real
+# desktop would have got — including that a repeating condition only raises one.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/notifies"\nexit 0\n' "$SANDBOX" > "$FB/notify-send"
 chmod +x "$FB"/*
 : > "$SANDBOX/model.bin"
 
@@ -519,6 +521,32 @@ leaky=$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$SCRIPT" \
 if [[ -z "$leaky" ]]; then ok "no listener child inherits the singleton lock"
 else no "no listener child inherits the singleton lock" "$leaky"; fi
 
+# A capture device that has lost its hardware streams zeros instead of failing,
+# which is why the mic can go deaf without anything erroring — the headset
+# moving to its other card did exactly this for 48 minutes. The fake recorder
+# is `cat /dev/zero`, so it is that device; with a short dead-ms the listener
+# must notice and rebuild rather than transcribe silence all evening.
+: > "$SANDBOX/notifies"   # earlier listeners in this file ran on the same
+                         # zero-stream recorder and raised their own popups
+dead_out=$(timeout 5 bash -c '
+    env -i PATH="'"$FB"':/usr/bin:/bin" HOME="'"$SANDBOX"'" \
+        XDG_RUNTIME_DIR="'"$XDG_RUNTIME_DIR"'" XDG_CONFIG_HOME="'"$XDG_CONFIG_HOME"'" \
+        DICTATE_WHISPER="'"$FB/fake-whisper"'" DICTATE_MODEL="'"$SANDBOX/model.bin"'" \
+        DICTATE_RECORDER="'"$FB/fake-recorder"'" LISTEN_DEAD_MS=200 \
+        bash "'"$SCRIPT"'" --run 2>&1 & pid=$!
+    sleep 3; kill -TERM $pid 2>/dev/null; wait $pid 2>/dev/null' )
+if grep -q "digital silence" <<<"$dead_out"; then ok "a silent capture device is noticed"
+else no "a silent capture device is noticed" "got: $dead_out"; fi
+# It must keep trying — one attempt and then giving up would be a mic that
+# never comes back — while telling you only once. A headset that is switched
+# off is silent on every device, so a popup per cycle is a popup per dead-ms.
+attempts=$(grep -c "digital silence" <<<"$dead_out")
+if (( attempts > 1 )); then ok "it keeps re-resolving while the mic stays silent ($attempts attempts)"
+else no "it keeps re-resolving while the mic stays silent" "attempts: $attempts"; fi
+popups=$(grep -c "mic went silent" "$SANDBOX/notifies" 2>/dev/null || echo 0)
+if (( popups == 1 )); then ok "the silence popup is raised once, not per cycle"
+else no "the silence popup is raised once, not per cycle" "popups: $popups of $attempts attempts"; fi
+
 # a recorder that isn't installed is refused up front, not respawn-looped
 missing_out=$(env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
     XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
@@ -551,6 +579,24 @@ PY
 )
 if (( utts >= 1 )); then ok "utterances still close after an ambient noise step (got $utts)"
 else no "utterances still close after an ambient noise step" "got $utts closed utterances"; fi
+
+# The marker is a contract between the segmenter and the read loop above, so
+# pin the exact string: zeros in, "!dead" out, and it stops rather than
+# reporting the same dead wire forever.
+zeros=$(head -c 32000 /dev/zero | timeout 10 python3 "$TESTS_DIR/../listen-segmenter.py" \
+        --outdir "$SANDBOX/seg-dead" --dead-ms 200 2>/dev/null)
+eq "digital silence reports !dead once" "$zeros" "!dead"
+
+# Noise must NOT read as a dead device, however quiet — that distinction is the
+# whole basis for switching mics, and getting it wrong would cycle the stream
+# under someone mid-sentence.
+noise=$(python3 -c "
+import os, sys, random
+random.seed(7)
+sys.stdout.buffer.write(bytes(random.randrange(256) for _ in range(32000)))" \
+        | timeout 10 python3 "$TESTS_DIR/../listen-segmenter.py" \
+              --outdir "$SANDBOX/seg-noise" --dead-ms 200 2>/dev/null | grep -c '^!dead$')
+eq "quiet noise is not a dead device" "$noise" "0"
 
 echo
 echo "passed: $pass  failed: $fail"
