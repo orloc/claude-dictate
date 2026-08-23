@@ -160,6 +160,19 @@ wait
 eq "racing spawns claim distinct names" \
    "$(roster list | cut -f1 | sort | paste -sd' ')" "alpha bravo"
 
+echo "# lock hygiene"
+# A tmux client that has to auto-start the server hands it every open fd, and
+# the server holds them for its whole life — so a lock fd reaching it is a lock
+# nothing can ever take again. It happened: a spawn from the listener left the
+# server sitting on the listener's singleton lock (fd 8), and every later
+# listener refused to start against a corpse. Both suite locks must be closed
+# at the calls that can fork a server.
+leaky=$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$SCRIPT" \
+        | grep -nE 'tmux (has-session|new-session|split-window|select-layout)' \
+        | grep -v '8>&-')
+if [[ -z "$leaky" ]]; then ok "no tmux client inherits a suite lock"
+else no "no tmux client inherits a suite lock" "$leaky"; fi
+
 echo
 echo "passed: $pass  failed: $fail"
 [[ $fail -eq 0 ]]

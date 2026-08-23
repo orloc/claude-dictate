@@ -282,8 +282,16 @@ tone(f"{d}/tone-off.wav",   [(880, 60, .30), (660, 60, .30), (440, 110, .30)])
 PY
 }
 
-tone() { "$HERE/claude-speak" --play "$TONE_DIR/tone-$1.wav" 2>/dev/null & }
-speak() { printf '%s' "$1" | "$HERE/claude-speak"; }
+# Every child of the listener is spawned with 8>&-. Fd 8 is the singleton
+# lock, and its flock lives as long as ANY process holding that descriptor —
+# so one long-lived grandchild is enough to hold it forever. That is not
+# hypothetical: `roster spawn` runs a tmux client, the client forked a tmux
+# server, the server inherited fd 8 and sat on it, and from then on every
+# listener refused to start because a corpse "was already running". Short-
+# lived children can't cause it, but they're closed too — the rule is easier
+# to keep than the exception.
+tone() { "$HERE/claude-speak" --play "$TONE_DIR/tone-$1.wav" 2>/dev/null 8>&- & }
+speak() { printf '%s' "$1" | "$HERE/claude-speak" 8>&-; }
 
 # Spoken, not printed. Three things follow from that and shape every line
 # below:
@@ -363,19 +371,19 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
 
 transcribe() {
     "$WHISPER" -m "$MODEL" -f "$1" --no-prints --no-timestamps --suppress-nst \
-        2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+        2>/dev/null 8>&- | tr '\n' ' ' 8>&- | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' 8>&-
 }
 
 # All roster traffic funnels through one seam, so the tests can fake the
 # roster without a tmux server.
-roster() { "$HERE/claude-roster" "$@"; }
+roster() { "$HERE/claude-roster" "$@" 8>&-; }
 
 send_buffer() {
     local text="$1"
     [[ -n "$text" ]] || { tone err; notify critical 3000 "nothing to send"; return 0; }
     local -a to=()
     [[ -n "$TX_TARGET" && "$TX_TARGET" != "$CALLSIGN" ]] && to=(--to "$TX_TARGET")
-    if "$HERE/claude-dictate" --send "${to[@]}" "$text"; then
+    if "$HERE/claude-dictate" --send "${to[@]}" "$text" 8>&-; then
         log "sent${to[1]:+ to ${to[1]}}: $text"
         notify normal 5000 "➜ $text"
     else
@@ -516,7 +524,7 @@ handle() {
         IFS=$'\t' read -r who act a1 a2 <<<"$out"
         case "$act" in
             open)   cmd_open "$who" ;;
-            hush)   "$HERE/claude-speak" --stop; tone ack
+            hush)   "$HERE/claude-speak" --stop 8>&-; tone ack
                     notify low 2000 "stopped speaking" ;;
             status) s=$(status_text); speak "$s"; notify low 3000 "$s" ;;
             help)   speak "$(help_text "$a1")"

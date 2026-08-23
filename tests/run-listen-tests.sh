@@ -507,6 +507,18 @@ third_out=$(timeout 3 bash -c '
 if grep -q "listening" <<<"$third_out"; then ok "the lock is released when the holder dies"
 else no "the lock is released when the holder dies" "got: $third_out"; fi
 
+# The leak that actually happened, guarded at the source. A child that
+# inherits fd 8 holds the singleton flock for as long as it lives, and one of
+# the listener's grandchildren is a tmux server: `roster spawn` forked one, it
+# inherited the lock, and every later listener then refused to start against a
+# process that had been dead for hours. Nothing the listener spawns should see
+# that descriptor. Continuation lines are joined first, so a redirection that
+# sits on the next line still counts.
+leaky=$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$SCRIPT" \
+        | grep -nE '"\$HERE/claude-|"\$WHISPER" -m' | grep -v '8>&-')
+if [[ -z "$leaky" ]]; then ok "no listener child inherits the singleton lock"
+else no "no listener child inherits the singleton lock" "$leaky"; fi
+
 # a recorder that isn't installed is refused up front, not respawn-looped
 missing_out=$(env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
     XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
