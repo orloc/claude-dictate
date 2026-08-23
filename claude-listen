@@ -54,11 +54,14 @@
 #                      (default: alpha bravo charlie delta echo foxtrot)
 #   LISTEN_POOL_ALIASES  name:alias,alias;name:alias — whisper misspellings
 #                      per pool name (defaults built in)
-#   LISTEN_MAX_TX      seconds before an unclosed transmission sends itself
+#   LISTEN_MAX_TX      seconds of QUIET that close an unkeyed transmission
 #                      (default: 30 — this is a blast radius, not a
 #                      convenience. Whatever is audible when you forget to
 #                      say "out" gets dictated, so the number should be the
 #                      most room audio you are willing to send.)
+#   LISTEN_MAX_TX_TOTAL  hard ceiling on one transmission however much you
+#                      say (default: 900, 0 disables) — the runaway guard for
+#                      a room that never falls quiet
 #   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
 #   LISTEN_CLOSE_MS    silence that ends an utterance (700)
 #
@@ -87,6 +90,7 @@ ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark;scarlett;scarlet;skylarke;s
 POOL="${LISTEN_POOL:-alpha bravo charlie delta echo foxtrot}"
 POOL_ALIASES="${LISTEN_POOL_ALIASES:-alpha:alfa;bravo:brava,brovo;charlie:charley,charly;echo:eco,ecko;foxtrot:fox trot,foxtrott,fox trott}"
 MAX_TX="${LISTEN_MAX_TX:-30}"
+MAX_TX_TOTAL="${LISTEN_MAX_TX_TOTAL:-900}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
 ROSTER_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/roster"
@@ -352,6 +356,7 @@ Or $c, help, management."
 STATE=standby
 BUFFER=""
 TX_START=0
+TX_LAST=0        # when the open transmission last heard a word (see check_timeout)
 TX_TARGET=""     # canonical name the open transmission belongs to
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
@@ -422,7 +427,7 @@ cmd_open() {
         roster focus "$who" >/dev/null 2>&1
     fi
     TX_TARGET="$who"
-    STATE=transmitting; BUFFER=""; TX_START=$SECONDS
+    STATE=transmitting; BUFFER=""; TX_START=$SECONDS; TX_LAST=$SECONDS
     tone open; log "mic open for $who"
     notify low 90000 "🔴 mic open ($who) — \"$who, out\" to send"
 }
@@ -498,6 +503,11 @@ handle() {
     # case you need to see when the thing appears to ignore you.
     log "heard [$STATE]: \"$text\" -> \"$norm\""
     [[ -n "$norm" ]] || return 0
+    # Something was said, so the transmission is still alive — the quiet
+    # ceiling measures from here, not from when the mic opened. Empty
+    # transcriptions deliberately don't count: room noise that whisper hears
+    # no words in shouldn't be able to hold the channel open.
+    [[ "$STATE" == transmitting ]] && TX_LAST=$SECONDS
 
     if [[ "$STATE" == standby ]]; then
         # In standby nothing is dictation — an utterance is either a command
@@ -550,11 +560,13 @@ handle() {
 }
 
 # One utterance's worth of work. handle() and check_timeout() belong on the
-# same path and in this order: the ceiling exists for a transmission nobody
-# closed, and speech arriving is exactly the condition under which that
-# happens. Checking it only when the room falls quiet — which is what the
-# read loop used to do — leaves a conversation or a speakerphone free to
-# hold the channel open indefinitely.
+# same path and in this order: the total ceiling exists for a transmission
+# nobody closed, and speech arriving is exactly the condition under which that
+# happens. Checking it only when the room falls quiet — which is what the read
+# loop used to do — leaves a conversation or a speakerphone free to hold the
+# channel open indefinitely. The order also means handle() has already
+# refreshed the quiet clock by the time we look, so a caller on this path can
+# only ever trip the total ceiling, never the silence one.
 pump() {
     handle "$1"
     check_timeout
@@ -562,11 +574,32 @@ pump() {
 
 # A missed "out" would otherwise hold the channel open forever, so a long
 # transmission closes and sends itself rather than being lost.
+#
+# The clock that decides this is the one since you last said something, not
+# the one since the mic opened. Timing the whole transmission cut long
+# dictation off mid-thought, and the cut is worse than it sounds: everything
+# said afterwards arrives in standby, where an utterance that isn't a command
+# is discarded outright. One number too small made the thing interrupt you and
+# then go deaf. Quiet is the actual evidence that you walked away without
+# keying out, so MAX_TX times silence.
+#
+# MAX_TX_TOTAL is the backstop for what quiet can't catch — a conversation or
+# a speakerphone that keeps feeding the buffer and never lets the idle clock
+# run. It has to exist, or an idle clock that speech keeps resetting never
+# fires at all; it sits far above any one dictation so it only ever catches a
+# runaway. 0 disables it.
 check_timeout() {
     [[ "$STATE" == transmitting ]] || return 0
-    (( SECONDS - TX_START < MAX_TX )) && return 0
-    log "max transmission reached — sending"
-    notify normal 4000 "max transmission reached — sending"
+    local why
+    if (( SECONDS - TX_LAST >= MAX_TX )); then
+        why="${MAX_TX}s of quiet with the mic open"
+    elif (( MAX_TX_TOTAL > 0 && SECONDS - TX_START >= MAX_TX_TOTAL )); then
+        why="${MAX_TX_TOTAL}s transmission ceiling"
+    else
+        return 0
+    fi
+    log "$why — sending"
+    notify normal 4000 "$why — sending"
     STATE=standby; tone close
     send_buffer "$BUFFER"; BUFFER=""; TX_TARGET=""
 }

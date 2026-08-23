@@ -259,7 +259,8 @@ if grep -qw err <<<"$TONES"; then ok "closing an already-closed mic errors"
 else no "closing an already-closed mic errors" "tones: $TONES"; fi
 
 # the transmission timeout must send rather than lose the buffer
-STATE=transmitting; BUFFER="a long thought"; SENT=""; TX_START=$SECONDS; MAX_TX=0
+STATE=transmitting; BUFFER="a long thought"; SENT=""
+TX_START=$SECONDS; TX_LAST=$SECONDS; MAX_TX=0
 check_timeout
 eq "timeout closes the mic"  "$STATE" "standby"
 eq "timeout sends the buffer" "$SENT" "a long thought"
@@ -270,19 +271,49 @@ eq "timeout sends the buffer" "$SENT" "a long thought"
 # dictated. pump() is the pairing; drive it the way the read loop does.
 pumped() { NEXT_TEXT="$1"; pump "$SANDBOX/nonexistent.wav"; }
 
+# What the ceiling must NOT do is interrupt someone who is still talking. The
+# quiet clock restarts on every utterance, so a dictation far longer than
+# MAX_TX stays open as long as the gaps are shorter than it.
 STATE=transmitting; BUFFER=""; SENT=""; TX_TARGET=skylark
-TX_START=$SECONDS; MAX_TX=0
+TX_START=$((SECONDS - 600)); TX_LAST=$((SECONDS - 5)); MAX_TX=30; MAX_TX_TOTAL=900
 pumped "and then the parser reads the header"
-eq "continuous speech still hits the ceiling" "$STATE" "standby"
-eq "the ceiling sends what it had"            "$SENT"  "and then the parser reads the header"
+eq "a long dictation is not cut off"   "$STATE"  "transmitting"
+eq "a long dictation sends nothing"    "$SENT"   ""
+eq "a long dictation keeps buffering"  "$BUFFER" "and then the parser reads the header"
 
-# ...and an utterance arriving well inside the window must not trip it.
+# Quiet is what closes it: nothing said for MAX_TX means you walked away
+# without keying out.
+STATE=transmitting; BUFFER="a thought nobody closed"; SENT=""; TX_TARGET=skylark
+TX_START=$((SECONDS - 100)); TX_LAST=$((SECONDS - 100)); MAX_TX=30
+check_timeout
+eq "quiet closes the mic"       "$STATE" "standby"
+eq "quiet sends what it had"    "$SENT"  "a thought nobody closed"
+
+# Noise whisper finds no words in must not hold the channel open — otherwise
+# a fan or a keyboard resets the quiet clock forever.
+STATE=transmitting; BUFFER="half a sentence"; SENT=""; TX_TARGET=skylark
+TX_START=$((SECONDS - 100)); TX_LAST=$((SECONDS - 100)); MAX_TX=30
+pumped ""
+eq "an empty transcription does not extend the mic" "$STATE" "standby"
+eq "the quiet ceiling still sent the buffer"        "$SENT"  "half a sentence"
+
+# The total ceiling is the backstop for a room that never falls quiet: speech
+# keeps resetting the quiet clock, so only elapsed length can catch it.
 STATE=transmitting; BUFFER=""; SENT=""; TX_TARGET=skylark
-TX_START=$SECONDS; MAX_TX=900
-pumped "still mid sentence here"
-eq "speech inside the window keeps the mic open" "$STATE" "transmitting"
-eq "speech inside the window sends nothing"      "$SENT"  ""
-MAX_TX=90
+TX_START=$((SECONDS - 100)); TX_LAST=$SECONDS; MAX_TX=900; MAX_TX_TOTAL=60
+pumped "someone else entirely is talking now"
+eq "continuous speech still hits the total ceiling" "$STATE" "standby"
+eq "the total ceiling sends what it had"            "$SENT"  "someone else entirely is talking now"
+
+# ...and zero disables it, for anyone who would rather nothing ever fired but
+# silence.
+STATE=transmitting; BUFFER=""; SENT=""; TX_TARGET=skylark
+TX_START=$((SECONDS - 100000)); TX_LAST=$SECONDS; MAX_TX=900; MAX_TX_TOTAL=0
+pumped "still going"
+eq "a zero total ceiling never fires" "$STATE" "transmitting"
+eq "a zero total ceiling sends nothing" "$SENT" ""
+
+MAX_TX=90; MAX_TX_TOTAL=900
 
 # --- named instances ----------------------------------------------------------
 echo "# named instances"

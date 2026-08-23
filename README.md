@@ -232,14 +232,23 @@ much as you like. The test suite is mostly these near-misses.
 Two structural consequences worth knowing. While the mic is open **everything
 is dictation** — "skylark, help" mid-transmission is typed, not run, because
 inside a transmission only the closing commands exist. And a transmission you
-forget to close sends itself after `LISTEN_MAX_TX` rather than being lost.
+forget to close sends itself rather than being lost.
+
+`LISTEN_MAX_TX` is how much **quiet** ends it — 30 seconds of nobody saying
+anything, by default. It deliberately measures silence rather than length: an
+open mic that closes on its own after N seconds of speech interrupts you
+mid-thought, and the interruption is worse than it sounds, because everything
+you say after the cut arrives in standby, where anything that isn't a command
+is discarded. Speak as long as you like; pauses shorter than `LISTEN_MAX_TX`
+keep the channel yours.
 
 Treat that number as a blast radius rather than a convenience. An open mic
 dictates whatever is audible, so a transmission you walked away from ships the
-room — a conversation, a phone call, whoever else is talking. The default is 30
-seconds, and the ceiling is checked on every utterance, not only when the room
-falls quiet: continuous speech is precisely when a forgotten transmission runs
-away, so a guard that only fires during silence would never fire at all.
+room — a conversation, a phone call, whoever else is talking. Quiet can't catch
+that case (a room that keeps talking never goes quiet), which is what
+`LISTEN_MAX_TX_TOTAL` is for: a hard ceiling on one transmission however much
+is said into it, default 15 minutes, `0` to disable. It sits far above any real
+dictation so it only ever catches a runaway.
 
 **Feedback is tonal, not spoken** — rising two-tone for open, falling for
 close, a descending triple for discard, a low buzz for a command that made no
@@ -285,7 +294,8 @@ scripts read the same file):
 | `SPEAK_SINK` | the mic's card | output sink to play through |
 | `LISTEN_CALLSIGN` | `skylark` | the callsign every command carries |
 | `LISTEN_ALIASES` | `sky lark;skylar;sky clark` | `;`-separated spellings whisper might produce instead |
-| `LISTEN_MAX_TX` | `30` | seconds before an unclosed transmission sends itself |
+| `LISTEN_MAX_TX` | `30` | seconds of quiet that close an unkeyed transmission |
+| `LISTEN_MAX_TX_TOTAL` | `900` | hard ceiling on one transmission, `0` disables |
 | `LISTEN_MARGIN_DB` | `12` | dB above the noise floor that counts as speech |
 | `LISTEN_CLOSE_MS` | `700` | silence that ends an utterance |
 
