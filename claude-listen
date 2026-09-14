@@ -54,6 +54,14 @@
 #                      (default: alpha bravo charlie delta echo foxtrot)
 #   LISTEN_POOL_ALIASES  name:alias,alias;name:alias — whisper misspellings
 #                      per pool name (defaults built in)
+#   LISTEN_PROWORD_ALIASES  proword:alias,alias;… — what whisper produces for
+#                      a command word ("come in" → "command"). Defaults cover
+#                      the standalone prowords only: an alias for "out" or
+#                      "disregard" widens what can close a live transmission,
+#                      so those are yours to add.
+#   LISTEN_WHISPER_PROMPT  text whisper is primed with, biasing it toward the
+#                      callsign, names and prowords (default: built from
+#                      them; set empty to disable)
 #   LISTEN_MAX_TX      seconds of QUIET that close an unkeyed transmission
 #                      (default: 30 — this is a blast radius, not a
 #                      convenience. Whatever is audible when you forget to
@@ -94,6 +102,7 @@ CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
 ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark;scarlett;scarlet;skylarke;sky lock;skylab;sly lark}"
 POOL="${LISTEN_POOL:-alpha bravo charlie delta echo foxtrot}"
 POOL_ALIASES="${LISTEN_POOL_ALIASES:-alpha:alfa;bravo:brava,brovo;charlie:charley,charly;echo:eco,ecko;foxtrot:fox trot,foxtrott,fox trott}"
+PROWORD_ALIASES="${LISTEN_PROWORD_ALIASES:-come in:command,come on,coming,come an,comin;silence:silent,silents,science;radio check:radio cheque,radio checks;disregard:;out:}"
 MAX_TX="${LISTEN_MAX_TX:-30}"
 MAX_TX_TOTAL="${LISTEN_MAX_TX_TOTAL:-900}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
@@ -139,6 +148,18 @@ declare -A MGMT=(
     ["status"]=status
     ["reap"]=reap
 )
+# Spoken form → proword, the same shape as NAME_OF. Every proword maps to
+# itself; aliases only ever add spellings, never verbs.
+declare -A PW_OF=()
+for _pw in "${!PROWORDS[@]}"; do PW_OF["$_pw"]="$_pw"; done
+while IFS= read -r -d ';' _entry; do
+    [[ "$_entry" == *:* ]] || continue
+    _pw="${_entry%%:*}"
+    [[ -n "${PROWORDS[$_pw]:-}" ]] || continue
+    while IFS= read -r -d ',' _a; do [[ -n "$_a" ]] && PW_OF["$_a"]="$_pw"; done <<<"${_entry#*:},"
+done <<<"$PROWORD_ALIASES;"
+unset _pw _a _entry
+
 # Help submenus. The top level is a menu; these are the pages. Spellings
 # whisper actually produces are folded in, same as the name aliases — an
 # unknown page is not a command at all, which keeps "$c, help me out here"
@@ -177,10 +198,35 @@ normalize() {
         | sed -E "s/[^a-z0-9 ]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//"
 }
 
+# collapse_repeat(norm) — "alpha silence alpha silence alpha silence" →
+# "alpha silence". Whisper stacks a short phrase said once (or said again
+# after no answer) into one utterance; in standby that is either one command
+# or nothing, so the smallest phrase the utterance is a whole multiple of is
+# what was meant. Dictation is never collapsed — repetition there is content.
+collapse_repeat() {
+    local -a w
+    local n k i
+    read -ra w <<<"$1"
+    n=${#w[@]}
+    for ((k = 1; k <= n / 2; k++)); do
+        (( n % k == 0 )) || continue
+        for ((i = k; i < n; i++)); do [[ "${w[i]}" == "${w[i % k]}" ]] || continue 2; done
+        printf '%s' "${w[*]:0:k}"
+        return 0
+    done
+    printf '%s' "$1"
+}
+
 # canon_name(spoken) — resolve a command's ARGUMENT through the alias map.
 # Unknown spellings pass through unresolved, so the error can name what was
 # actually heard.
 canon_name() { printf '%s' "${NAME_OF[$1]:-$1}"; }
+
+is_terminal() {
+    local t
+    for t in "${TERMINAL[@]}"; do [[ "$t" == "$1" ]] && return 0; done
+    return 1
+}
 
 # is_directional(proword) — may it be spoken verb-first?
 is_directional() {
@@ -194,15 +240,16 @@ is_directional() {
 # Anything else — a longer sentence that merely contains the phrase — is not
 # a command.
 standalone_command() {
-    local n="$1" cs pw name rest topic
+    local n="$1" cs sp pw name rest topic
     for cs in "${!NAME_OF[@]}"; do
         name="${NAME_OF[$cs]}"
-        for pw in "${!PROWORDS[@]}"; do
-            if [[ "$n" != "$cs $pw" ]]; then
+        for sp in "${!PW_OF[@]}"; do
+            pw="${PW_OF[$sp]}"
+            if [[ "$n" != "$cs $sp" ]]; then
                 # Verb-first, for directional prowords only. The target is
                 # still guarded: $cs ranges over known spoken names, so
                 # "focus bravo" matches and "focus the parser" cannot.
-                is_directional "$pw" && [[ "$n" == "$pw $cs" ]] || continue
+                is_directional "$pw" && [[ "$n" == "$sp $cs" ]] || continue
             fi
             [[ "$pw" == focus && "$name" == "$CALLSIGN" ]] && continue
             printf '%s\t%s' "$name" "${PROWORDS[$pw]}"
@@ -240,11 +287,13 @@ standalone_command() {
 # necessarily terminate a transmission that carries content — they can't be
 # standalone.
 terminal_command() {
-    local n="$1" cs pw name suffix rest
+    local n="$1" cs sp pw name suffix rest
     for cs in "${!NAME_OF[@]}"; do
         name="${NAME_OF[$cs]}"
-        for pw in "${TERMINAL[@]}"; do
-            suffix="$cs $pw"
+        for sp in "${!PW_OF[@]}"; do
+            pw="${PW_OF[$sp]}"
+            is_terminal "$pw" || continue
+            suffix="$cs $sp"
             if [[ "$n" == "$suffix" || "$n" == *" $suffix" ]]; then
                 rest="${n%"$suffix"}"
                 rest="${rest% }"
@@ -407,8 +456,21 @@ nap() {
     return 0
 }
 
+# The prompt primes whisper's decoder with the vocabulary it will hear most,
+# which is how a proper noun like the callsign stops coming back as
+# "Scarlett". Checked against silence and pink/brown noise: the prompt is not
+# echoed back, the hallucinations stay the usual "you"/"thank you".
+default_prompt() {
+    local out="" n _first="${POOL%% *}"
+    for n in $CALLSIGN $POOL; do out+="${out:+ }${n^}, come in. ${n^}, out."; done
+    printf '%s %s, radio check. %s, silence. %s, disregard. %s, focus. %s, help.' \
+        "$out" "${CALLSIGN^}" "${CALLSIGN^}" "${CALLSIGN^}" "${_first^}" "${CALLSIGN^}"
+}
+WHISPER_PROMPT="${LISTEN_WHISPER_PROMPT-$(default_prompt)}"
+
 transcribe() {
     "$WHISPER" -m "$MODEL" -f "$1" --no-prints --no-timestamps --suppress-nst \
+        ${WHISPER_PROMPT:+--prompt "$WHISPER_PROMPT"} \
         2>/dev/null 8>&- | tr '\n' ' ' 8>&- | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' 8>&-
 }
 
@@ -558,7 +620,7 @@ handle() {
     if [[ "$STATE" == standby ]]; then
         # In standby nothing is dictation — an utterance is either a command
         # or it is ignored outright.
-        out=$(standalone_command "$norm") || { log "ignored: $norm"; return 0; }
+        out=$(standalone_command "$(collapse_repeat "$norm")") || { log "ignored: $norm"; return 0; }
         IFS=$'\t' read -r who act a1 a2 <<<"$out"
         case "$act" in
             open)   cmd_open "$who" ;;

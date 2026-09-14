@@ -51,6 +51,23 @@ eq "radio check is recognized"     "$(try_standalone 'Skylark, radio check')" $'
 eq "silence is recognized"         "$(try_standalone 'skylark silence')"      $'skylark\thush'
 eq "an alias spelling still works" "$(try_standalone 'Sky lark, come in')"    $'skylark\topen'
 eq "help takes a page"             "$(try_standalone 'skylark help basics')"   $'skylark\thelp\tbasics'
+# Proword aliases: what whisper has actually produced for the command words.
+eq "a proword alias resolves"      "$(try_standalone 'Bravo, command.')"      $'bravo\topen'
+eq "a proword alias reverses too"  "$(try_standalone 'command bravo')"        $'bravo\topen'
+eq "silence has aliases"           "$(try_standalone 'alpha silent')"         $'alpha\thush'
+eq "radio check alias resolves"    "$(try_standalone 'skylark radio cheque')" $'skylark\tstatus'
+eq "an alias is still whole-utterance" "$(try_standalone 'i said bravo command')" "(none)"
+# The closing prowords ship without aliases: an alias there widens what can
+# end a live transmission, and that is a config decision, not a default.
+eq "out has no default alias"      "$(terminal_command 'fix it alpha how' || printf '(none)')" "(none)"
+
+echo "# collapse_repeat"
+eq "a stacked command folds to one"  "$(collapse_repeat 'alpha silence alpha silence alpha silence')" "alpha silence"
+eq "a stacked single word folds"     "$(collapse_repeat 'out out out out')"                          "out"
+eq "a plain command is untouched"    "$(collapse_repeat 'skylark come in')"                          "skylark come in"
+eq "a partial repeat is untouched"   "$(collapse_repeat 'alpha silence alpha')"                      "alpha silence alpha"
+eq "unequal chunks are untouched"    "$(collapse_repeat 'alpha silence bravo silence')"              "alpha silence bravo silence"
+eq "empty stays empty"               "$(collapse_repeat '')"                                         ""
 eq "a page alias resolves"         "$(try_standalone 'Skylark, help, manage')" $'skylark\thelp\tmanagement'
 # The page must be known, or the prefix match becomes a way for ordinary
 # speech starting with the callsign to fire a command.
@@ -171,6 +188,18 @@ say "hey can you look at the parser for me"
 eq "standby ignores ordinary speech"   "$STATE" "standby"
 eq "standby dictates nothing"          "$SENT"  ""
 
+# The 02:08 case: whisper stacked one "alpha, silence" into four and the
+# command was dropped. Stacked in standby is one command; stacked while
+# transmitting is dictation and must reach Claude as heard.
+STATE=standby; BUFFER=""; SENT=""; TONES=""
+say "Alpha silence Alpha silence Alpha silence Alpha silence"
+eq "a stacked standby command fires"   "$TONES" "ack"
+say "skylark come in"
+say "do it again, do it again"
+say "skylark out"
+eq "repetition in dictation is kept"   "$SENT" "do it again, do it again"
+
+STATE=standby; BUFFER=""; SENT=""; TONES=""
 say "Skylark, come in."
 eq "come in opens the mic"             "$STATE" "transmitting"
 
