@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the claude-dictate janitor every 5 minutes
+
+[Timer]
+# A leaked recorder writes ~115 MB/hour to the tmpfs; five minutes keeps the
+# worst case under 10 MB and revives a crashed listener before it is missed.
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

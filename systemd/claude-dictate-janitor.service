@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep claude-dictate's runtime dir small and its listener alive
+
+[Service]
+Type=oneshot
+ExecStart=%h/dev/claude-dictate/claude-dictate-janitor
