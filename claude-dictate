@@ -104,11 +104,11 @@ stop_and_send() {
     rm -f "$claimed"
 
     # only signal if the PID still belongs to our recorder — a stale pidfile
-    # must not kill whatever process recycled the PID (cmdline, not comm:
-    # interpreter-script recorders show up as e.g. "bash")
-    local rec_name
-    rec_name=$(basename "${RECORDER%% *}")
-    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$rec_name"; then
+    # must not kill whatever process recycled the PID. Identify it by the wav
+    # path we handed it, not the recorder's name: a wrapper that execs the real
+    # recorder (claude-mic → pw-record) no longer carries its own name in the
+    # cmdline, and a name match left a pw-record writing rec.wav after every press.
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$WAV"; then
         kill "$pid" 2>/dev/null
         # wait for the recorder to flush and close the wav (not our child, so no `wait`)
         timeout 2 tail --pid="$pid" -f /dev/null

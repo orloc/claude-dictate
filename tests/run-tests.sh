@@ -313,6 +313,26 @@ kill "$BYSTANDER" 2>/dev/null
 sleep 0.5
 assert_eq "stale pidfile: nothing injected" "" "$(cat "$OUT")"
 
+# --- exec'ing wrapper recorder: the real recorder must still be stopped -----
+# claude-mic execs pw-record, so the recorder's cmdline no longer carries the
+# wrapper's name. The stop press must find it anyway or it records forever.
+printf '#!/usr/bin/env bash\nexec "%s/fake-recorder" "$@"\n' "$FAKEBIN" > "$FAKEBIN/exec-recorder"
+chmod +x "$FAKEBIN/exec-recorder"
+: > "$OUT"
+rm -f "$WAVFILE"
+run_dictate DICTATE_RECORDER="$FAKEBIN/exec-recorder"
+wait_for_wav || fail "exec recorder wrote wav"
+EXEC_REC_PID=$(cat "$PIDFILE" 2>/dev/null || echo 0)
+run_dictate DICTATE_RECORDER="$FAKEBIN/exec-recorder"
+assert_status "exec recorder: stop press exits 0" 0 "$?"
+sleep 0.5
+if kill -0 "$EXEC_REC_PID" 2>/dev/null; then
+    fail "exec recorder: recorder stopped (pid $EXEC_REC_PID still running)"
+    kill "$EXEC_REC_PID" 2>/dev/null
+else
+    pass "exec recorder: recorder stopped"
+fi
+
 # --- the Enter is a separate, delayed keystroke ------------------------------
 # Chained onto the text in one tmux command, the newline is swallowed by the
 # TUI still ingesting the transcript and the message never submits. The gap is
