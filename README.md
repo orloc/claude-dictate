@@ -264,9 +264,23 @@ can't collide with another app's notification.
 
 Speech is found by energy against a *rolling* estimate of the noise floor
 rather than a fixed threshold, since mic gain and room noise move around; the
-floor only learns from quiet frames, so a long sentence can't drag it up over
-itself. `LISTEN_MARGIN_DB` and `LISTEN_CLOSE_MS` are the knobs if it clips your
-first word or splits sentences at pauses.
+floor drops instantly on a quieter frame and climbs slowly, so a long sentence
+can't drag it up over itself. Opening also needs an absolute level
+(`LISTEN_MIN_DB`): a quiet headset's floor sits 20–30 dB below typing, and the
+margin alone would wake whisper on every keystroke. Staying open needs less
+(`LISTEN_HANG_DB` below that): a soft speaker's weak syllables sit well under
+their loud ones, and closing on them cuts a sentence into fragments that
+whisper transcribes without context — which is where words go missing.
+`LISTEN_MARGIN_DB`, `LISTEN_MIN_DB`, `LISTEN_HANG_DB` and `LISTEN_CLOSE_MS` are
+the knobs if it clips your first word or splits sentences at pauses.
+
+Whatever the energy gate lets through — a knock on the desk, a cough — whisper
+does not transcribe as nothing. It transcribes as "Thank you.", or, primed
+with the prowords, as "alpha, out". So each utterance is screened with Silero
+VAD inside whisper (`LISTEN_VAD_MODEL`, found automatically beside the whisper
+model as `ggml-silero-*.bin`; fetch it with whisper.cpp's
+`models/download-vad-model.sh silero-v5.1.2`). Non-speech comes back empty
+and never reaches the state machine.
 
 ### Which mic
 
@@ -344,6 +358,9 @@ scripts read the same file):
 | `LISTEN_MAX_TX` | `30` | seconds of quiet that close an unkeyed transmission |
 | `LISTEN_MAX_TX_TOTAL` | `900` | hard ceiling on one transmission, `0` disables |
 | `LISTEN_MARGIN_DB` | `12` | dB above the noise floor that counts as speech |
+| `LISTEN_MIN_DB` | `-55` | dBFS a frame must reach to open an utterance |
+| `LISTEN_HANG_DB` | `10` | how far below `LISTEN_MIN_DB` still keeps one open |
+| `LISTEN_VAD_MODEL` | `ggml-silero-*.bin` beside the whisper model | Silero VAD model whisper screens utterances with; empty disables |
 | `LISTEN_CLOSE_MS` | `700` | silence that ends an utterance |
 | `LISTEN_DEAD_MS` | `20000` | digitally silent capture that means the device is gone |
 | `DICTATE_MIC_MATCH` | any capture source | extended regex `claude-mic` requires of a source name |

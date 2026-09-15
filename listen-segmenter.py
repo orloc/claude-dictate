@@ -13,9 +13,20 @@ silence) and upward slowly on every frame — slowly enough that a sentence
 can't drag the floor up over itself, but steadily enough that a step-up in
 ambient noise is re-learned in seconds instead of holding the mic open.
 
+The margin alone is not enough on a quiet mic. A headset boom's floor can sit
+near -75 dBFS, which puts typing 20-30 dB above it — comfortably "speech" to
+any relative rule. So opening also needs an absolute level (--min-db). It is
+deliberately not a strict one: soft speech peaks in the same range as typing,
+so no energy rule separates them, and the caller's VAD is what finally does.
+This gate only has to keep the obviously-nothing frames from waking whisper.
+
 Hysteresis matters as much as the threshold. Opening needs several consecutive
 loud frames so a keyboard clack can't start an utterance, and closing needs a
 long run of quiet so a pause for breath mid-sentence doesn't split it in two.
+The level that keeps an utterance open is lower than the one that opens it
+(--hang-db below --min-db): a soft speaker's weak syllables sit well under
+their loud ones, and closing on them cuts a sentence into fragments that
+whisper then transcribes without context, which is where words get lost.
 
 One line that is not a wav path: "!dead", printed when the stream has been
 EXACTLY zero for --dead-ms, at which point this exits. A capture device whose
@@ -91,6 +102,10 @@ def main():
                     help="silence needed to end an utterance")
     ap.add_argument("--margin-db", type=float, default=12.0,
                     help="how far above the noise floor counts as speech")
+    ap.add_argument("--min-db", type=float, default=-55.0,
+                    help="dBFS a frame must reach to open an utterance")
+    ap.add_argument("--hang-db", type=float, default=10.0,
+                    help="how far below --min-db still keeps one open")
     ap.add_argument("--max-ms", type=int, default=90000,
                     help="hard cap on one utterance, so a stuck-open mic ends")
     ap.add_argument("--min-ms", type=int, default=300,
@@ -142,7 +157,8 @@ def main():
                 print("!dead", flush=True)
                 return
 
-        loud = level > floor + args.margin_db
+        gate = args.min_db if not speaking else args.min_db - args.hang_db
+        loud = level > max(floor + args.margin_db, gate)
 
         # The floor drops instantly on a quieter frame, and rises slowly on
         # EVERY frame — loud ones included. Rising only on quiet frames

@@ -71,7 +71,18 @@
 #                      say (default: 900, 0 disables) — the runaway guard for
 #                      a room that never falls quiet
 #   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
+#   LISTEN_MIN_DB      dBFS a frame must reach to open an utterance (-55) —
+#                      a quiet headset's floor sits far enough below typing
+#                      that the margin alone would wake whisper on keystrokes
+#   LISTEN_HANG_DB     how far below LISTEN_MIN_DB still keeps one open (10),
+#                      so a soft speaker's weak syllables don't split a
+#                      sentence into fragments whisper reads without context
 #   LISTEN_CLOSE_MS    silence that ends an utterance (700)
+#   LISTEN_VAD_MODEL   Silero VAD model whisper screens each utterance with
+#                      (default: the ggml-silero-*.bin beside DICTATE_MODEL;
+#                      set empty to disable). Without it whisper invents words
+#                      for a keystroke or a breath — and, primed with the
+#                      prowords, invents "alpha, out".
 #   LISTEN_DEAD_MS     digitally silent capture that means the device is gone
 #                      and the mic should be resolved again (20000)
 #   LISTEN_IDLE_RECHECK  seconds of hearing nothing at all after which the mic
@@ -106,6 +117,8 @@ PROWORD_ALIASES="${LISTEN_PROWORD_ALIASES:-come in:command,come on,coming,come a
 MAX_TX="${LISTEN_MAX_TX:-30}"
 MAX_TX_TOTAL="${LISTEN_MAX_TX_TOTAL:-900}"
 MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
+MIN_DB="${LISTEN_MIN_DB:--55}"
+HANG_DB="${LISTEN_HANG_DB:-10}"
 CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
 DEAD_MS="${LISTEN_DEAD_MS:-20000}"
 IDLE_RECHECK="${LISTEN_IDLE_RECHECK:-600}"
@@ -468,9 +481,24 @@ default_prompt() {
 }
 WHISPER_PROMPT="${LISTEN_WHISPER_PROMPT-$(default_prompt)}"
 
+# The energy gate cannot tell a knock from a word, and whisper given a knock
+# does not return nothing — it returns "Thank you.", or with the prompt above,
+# a proword. Silero VAD inside whisper screens the audio first, so non-speech
+# transcribes as empty and never reaches the state machine.
+default_vad_model() {
+    local f
+    for f in "$(dirname "$MODEL")"/ggml-silero*.bin; do
+        [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    return 0
+}
+VAD_MODEL="${LISTEN_VAD_MODEL-$(default_vad_model)}"
+[[ -n "$VAD_MODEL" && ! -f "$VAD_MODEL" ]] && { echo "VAD model not found: $VAD_MODEL — running without it" >&2; VAD_MODEL=""; }
+
 transcribe() {
     "$WHISPER" -m "$MODEL" -f "$1" --no-prints --no-timestamps --suppress-nst \
         ${WHISPER_PROMPT:+--prompt "$WHISPER_PROMPT"} \
+        ${VAD_MODEL:+--vad -vm "$VAD_MODEL"} \
         2>/dev/null 8>&- | tr '\n' ' ' 8>&- | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' 8>&-
 }
 
@@ -782,7 +810,8 @@ open_stream() {
     # running" against a corpse.
     exec 3< <($RECORDER - 2>/dev/null 8>&- \
         | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
-              --margin-db "$MARGIN_DB" --close-ms "$CLOSE_MS" \
+              --margin-db "$MARGIN_DB" --min-db "$MIN_DB" --hang-db "$HANG_DB" \
+              --close-ms "$CLOSE_MS" \
               --dead-ms "$DEAD_MS" 8>&-)
 }
 
@@ -816,6 +845,7 @@ run_listener() {
     echo $$ > "$PIDFILE"
     make_tones
     log "listening — say \"$CALLSIGN, come in\" to key up (\"$CALLSIGN, help\" for the protocol)"
+    [[ -n "$VAD_MODEL" ]] || log "no VAD model — whisper will hallucinate words on noise (see LISTEN_VAD_MODEL)"
 
     # SIGTERM is how --stop arrives, and bash won't run an EXIT trap for it
     # unless the signal is trapped too — otherwise the segmenter outlives us.

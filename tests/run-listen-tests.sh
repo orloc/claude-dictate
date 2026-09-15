@@ -609,6 +609,29 @@ PY
 if (( utts >= 1 )); then ok "utterances still close after an ambient noise step (got $utts)"
 else no "utterances still close after an ambient noise step" "got $utts closed utterances"; fi
 
+# Field measurement: a headset boom's floor sits near -75 dBFS, so a breath at
+# -58 is 17 dB above it — "speech" to the margin rule alone, and whisper then
+# hallucinates a proword for it. The absolute gate must hold that shut. But
+# once a soft voice (-48) has opened the mic, its weak syllables at that same
+# -58 must NOT close it: they did, and the sentence reached whisper as
+# 1-second fragments it transcribed without context, losing words.
+segu() {  # segu "AMP SECS AMP SECS ..." -> closed utterances, 2s of floor around it
+    local d="$SANDBOX/seg-${1// /-}"; mkdir -p "$d"
+    python3 - $1 <<'PY' | timeout 15 python3 "$TESTS_DIR/../listen-segmenter.py" --outdir "$d" 2>/dev/null | wc -l
+import math, struct, sys
+out, RATE = sys.stdout.buffer, 16000
+def block(a, secs, freq=200):
+    for i in range(int(RATE * secs)):
+        out.write(struct.pack('<h', int(a * math.sin(2*math.pi*freq*i/RATE))))
+block(8, 2)
+for a, secs in zip(sys.argv[1::2], sys.argv[2::2]): block(int(a), float(secs))
+block(8, 2)
+PY
+}
+eq "a breath 17 dB over a quiet floor does not open the mic" "$(segu "58 1")" "0"
+eq "a soft voice over the same floor does" "$(segu "184 1")" "1"
+eq "its weak syllables do not split the sentence" "$(segu "184 0.5 58 1 184 0.5")" "1"
+
 # The marker is a contract between the segmenter and the read loop above, so
 # pin the exact string: zeros in, "!dead" out, and it stops rather than
 # reporting the same dead wire forever.
