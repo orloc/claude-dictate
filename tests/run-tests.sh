@@ -447,6 +447,20 @@ fi
 sleep 0.3
 assert_eq "the refused send reaches no pane" "" "$(cat "$OUT")$(cat "$OUT2")"
 
+# A pane scrolled back with the mouse is in copy mode; send-keys there feeds
+# the text to copy mode's key table and the prompt never sees it.
+: > "$OUT2"
+TMUX_TMPDIR="$TMUXDIR" tmux copy-mode -t "$PANE2"
+run_send_to bravo "typed over a scrollback"
+assert_status "copy-mode pane: send exits 0" 0 "$?"
+if wait_for_out2; then
+    assert_eq "copy-mode pane: text still reaches the prompt" "typed over a scrollback" "$(cat "$OUT2")"
+else
+    fail "copy-mode pane: text still reaches the prompt (nothing arrived)"
+fi
+assert_eq "copy-mode pane: left in normal mode" "0" \
+    "$(TMUX_TMPDIR="$TMUXDIR" tmux display-message -t "$PANE2" -p '#{pane_in_mode}')"
+
 # Per-pane locks: two concurrent sends to DIFFERENT panes must not serialize.
 # Each holds its lock across a 1s submit delay; run in parallel they finish in
 # well under the 2s a shared lock would force (generous bound for slow days).

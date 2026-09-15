@@ -172,6 +172,12 @@ inject() {
     exec 8>>"$RUN_DIR/$lock"
     flock -w 30 8 || die "another dictation is mid-send"
 
+    # A pane scrolled back with the mouse is in copy mode, and send-keys then
+    # feeds each character to copy mode's key table instead of the prompt —
+    # the text vanishes (and the first bound key that cancels the mode makes
+    # the rest fail with "not in a mode"). Drop out of any mode first.
+    tmux copy-mode -q -t "$dest" 2>/dev/null
+
     # tmux argv parsing eats a trailing unescaped ';' — escape it
     [[ "$text" == *\; ]] && text="${text%;}\\;"
     tmux send-keys -t "$dest" -l -- "$text" || die "tmux send-keys failed"
