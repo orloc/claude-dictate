@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# claude-dictate-janitor — keep the voice loop's runtime dir small and its
+# listener alive. Meant to run every few minutes from a systemd user timer
+# (see systemd/); safe to run by hand.
+#
+# What it fixes, each a thing that has actually happened on this machine:
+#   - a push-to-talk recorder left running after the stop press, writing
+#     rec.wav on the tmpfs until /run/user fills (2.8 GB, 2026-09-13)
+#   - a listener whose pidfile says "running" but whose process is gone
+#   - a second top-level listener fighting the first for the mic
+#   - listen.log growing without bound
+#
+# Exit 0 always; findings go to stdout (the journal under systemd).
+
+set -u
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+WAV="$RUN_DIR/rec.wav"
+REC_PID="$RUN_DIR/rec.pid"
+LISTEN_PID="$RUN_DIR/listen.pid"
+LISTEN_LOG="$RUN_DIR/listen.log"
+
+MAX_REC_SECS="${JANITOR_MAX_REC_SECS:-600}"        # no dictation is 10 minutes long
+MAX_WAV_BYTES="${JANITOR_MAX_WAV_BYTES:-200000000}" # 200 MB ≈ 100 min of 16 kHz mono
+MAX_LOG_BYTES="${JANITOR_MAX_LOG_BYTES:-5000000}"
+KEEP_LOG_LINES=2000
+
+say() { printf 'janitor: %s\n' "$*"; }
+
+# pids holding rec.wav open. An fd, not a cmdline match: a shell or editor whose
+# command merely names the path must not be killed, and a recorder still writing
+# an already-deleted rec.wav (the "(deleted)" link) must be.
+wav_writers() {
+    local pid
+    for pid in $(pgrep -f -- "$WAV" 2>/dev/null) $(fuser "$WAV" 2>/dev/null); do
+        [[ "$pid" == "$$" ]] && continue
+        if ls -l "/proc/$pid/fd" 2>/dev/null | grep -qF -- "$WAV"; then echo "$pid"; fi
+    done | sort -u
+}
+
+etimes() { ps -o etimes= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# --- push-to-talk recorders ------------------------------------------------
+claimed=$(cat "$REC_PID" 2>/dev/null || true)
+for pid in $(wav_writers); do
+    [[ "$pid" == "$$" ]] && continue
+    age=$(etimes "$pid"); age=${age:-0}
+    if [[ "$pid" != "$claimed" ]]; then
+        reason="orphan (not in rec.pid)"
+    elif (( age > MAX_REC_SECS )); then
+        reason="running ${age}s > ${MAX_REC_SECS}s"
+    else
+        continue
+    fi
+    kill "$pid" 2>/dev/null && say "killed recorder $pid: $reason"
+done
+# a claim whose process is gone would make the next start press think it lost
+# a double-fire race and bow out
+if [[ -n "$claimed" ]] && ! kill -0 "$claimed" 2>/dev/null; then
+    rm -f "$REC_PID" && say "removed stale rec.pid ($claimed)"
+fi
+
+# --- the wav itself ---------------------------------------------------------
+if [[ -f "$WAV" ]]; then
+    size=$(stat -c%s "$WAV" 2>/dev/null || echo 0)
+    if (( size > MAX_WAV_BYTES )); then
+        for pid in $(wav_writers); do kill "$pid" 2>/dev/null; done
+        rm -f "$WAV" && say "removed rec.wav (${size} bytes > ${MAX_WAV_BYTES})"
+    elif [[ -z "$(wav_writers)" ]] && (( $(( $(date +%s) - $(stat -c%Y "$WAV") )) > MAX_REC_SECS )); then
+        # nobody is writing it and no stop press wants it any more
+        rm -f "$WAV" && say "removed abandoned rec.wav (${size} bytes)"
+    fi
+fi
+
+# --- the listener -----------------------------------------------------------
+lp=$(cat "$LISTEN_PID" 2>/dev/null || true)
+if [[ "$lp" =~ ^[0-9]+$ ]]; then
+    # top-level --run processes only: the listener forks subshells that carry
+    # the same cmdline, so a parent check tells duplicates from children
+    for pid in $(pgrep -f -- "claude-listen --run" 2>/dev/null); do
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        [[ -n "$ppid" ]] || continue
+        if ! tr '\0' ' ' < "/proc/$ppid/cmdline" 2>/dev/null | grep -q -- "claude-listen --run"; then
+            if [[ "$pid" != "$lp" ]]; then
+                kill "$pid" 2>/dev/null && say "killed duplicate listener $pid (pidfile says $lp)"
+            fi
+        fi
+    done
+    if ! kill -0 "$lp" 2>/dev/null; then
+        # pidfile survives only a crash: a clean --stop removes it. Revive out
+        # of our own cgroup, or a oneshot service would take it down with us.
+        say "listener $lp is dead; restarting"
+        if command -v systemd-run >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+            systemd-run --user --quiet --collect --unit "claude-listen-revive-$(date +%s)" \
+                -p "StandardOutput=append:$LISTEN_LOG" -p "StandardError=append:$LISTEN_LOG" \
+                -- "$HERE/claude-listen" --run
+        else
+            "$HERE/claude-listen" --start
+        fi
+    fi
+fi
+
+# --- the log ----------------------------------------------------------------
+if [[ -f "$LISTEN_LOG" ]] && (( $(stat -c%s "$LISTEN_LOG") > MAX_LOG_BYTES )); then
+    tail -n "$KEEP_LOG_LINES" "$LISTEN_LOG" > "$LISTEN_LOG.tmp" && mv "$LISTEN_LOG.tmp" "$LISTEN_LOG"
+    say "trimmed listen.log to $KEEP_LOG_LINES lines"
+fi
+
+# --- the tmpfs --------------------------------------------------------------
+use=$(df --output=pcent "${XDG_RUNTIME_DIR:-/tmp}" 2>/dev/null | tail -1 | tr -d ' %')
+if [[ "$use" =~ ^[0-9]+$ ]] && (( use >= 80 )); then
+    say "WARNING ${XDG_RUNTIME_DIR:-/tmp} is ${use}% full; largest: $(du -sh "${XDG_RUNTIME_DIR:-/tmp}"/* 2>/dev/null | sort -rh | head -3 | tr '\n' ' ')"
+fi
+exit 0

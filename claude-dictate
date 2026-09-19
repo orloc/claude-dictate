@@ -5,6 +5,12 @@
 # with whisper.cpp, and inject the text into the tmux session via send-keys
 # — no window focus required, so it works while a game owns your keyboard.
 #
+# Also the one injection primitive for the rest of the suite:
+#
+#   claude-dictate --send TEXT                  into the session's active pane
+#   claude-dictate --send --to NAME|PANE TEXT   into a named instance's pane
+#                                               (names come from claude-roster)
+#
 # Config: env vars, or set them in ~/.config/claude-dictate/config
 # (plain shell, sourced if present):
 #
@@ -14,6 +20,8 @@
 #   DICTATE_RECORDER  record command; gets the output .wav appended, must
 #                     write 16kHz mono s16 and stop cleanly on SIGTERM
 #                     (default: pw-record --rate 16000 --channels 1 --format s16)
+#   DICTATE_SUBMIT_DELAY  pause between the text and the Enter that submits
+#                     it, in seconds (default: 0.5) — see stop_and_send
 set -u
 
 notify() { # notify(urgency, timeout_ms, body)
@@ -39,6 +47,10 @@ WHISPER="${DICTATE_WHISPER:-whisper-cli}"
 MODEL="${DICTATE_MODEL:-}"
 TARGET="${DICTATE_TARGET:-claude}"
 RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
+SUBMIT_DELAY="${DICTATE_SUBMIT_DELAY:-0.5}"
+# A malformed delay would make `sleep` fail instantly, silently resurrecting
+# the swallowed-Enter bug the delay exists to prevent.
+[[ "$SUBMIT_DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]] || SUBMIT_DELAY=0.5
 
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
 PIDFILE="$RUN_DIR/rec.pid"
@@ -65,6 +77,13 @@ is_hallucination() {
 }
 
 start_recording() {
+    # Barge-in: a reply still being read aloud would end up in the recording,
+    # so cut it off before opening the mic. Sibling-resolved, not PATH: hotkey
+    # environments often lack ~/.local/bin, and a silently skipped stop means
+    # the mic records Claude's own voice off the speakers.
+    local here
+    here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+    [[ -x "$here/claude-speak" ]] && "$here/claude-speak" --stop
     rm -f "$WAV"
     $RECORDER "$WAV" &
     local pid=$!
@@ -85,11 +104,11 @@ stop_and_send() {
     rm -f "$claimed"
 
     # only signal if the PID still belongs to our recorder — a stale pidfile
-    # must not kill whatever process recycled the PID (cmdline, not comm:
-    # interpreter-script recorders show up as e.g. "bash")
-    local rec_name
-    rec_name=$(basename "${RECORDER%% *}")
-    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$rec_name"; then
+    # must not kill whatever process recycled the PID. Identify it by the wav
+    # path we handed it, not the recorder's name: a wrapper that execs the real
+    # recorder (claude-mic → pw-record) no longer carries its own name in the
+    # cmdline, and a name match left a pw-record writing rec.wav after every press.
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$WAV"; then
         kill "$pid" 2>/dev/null
         # wait for the recorder to flush and close the wav (not our child, so no `wait`)
         timeout 2 tail --pid="$pid" -f /dev/null
@@ -112,17 +131,80 @@ stop_and_send() {
         return 0
     fi
 
-    tmux has-session -t "=$TARGET" 2>/dev/null \
-        || die "no tmux session '$TARGET' — start one with: tmux new -s $TARGET claude"
-
-    # tmux argv parsing eats a trailing unescaped ';' — escape it
-    [[ "$text" == *\; ]] && text="${text%;}\\;"
-    tmux send-keys -t "=$TARGET:" -l -- "$text" \; send-keys -t "=$TARGET:" Enter \
-        || die "tmux send-keys failed"
+    inject "$text"
     notify normal 4000 "➜ $text"
 }
 
+# resolve_pane(name-or-pane) — a %N pane id passes through; anything else is
+# looked up in the roster claude-roster maintains. Read directly rather than
+# via a claude-roster subprocess: this is the hot path of every send.
+resolve_pane() {
+    local t="$1"
+    [[ "$t" == %* ]] && { printf '%s' "$t"; return 0; }
+    awk -F'\t' -v n="$t" '$1 == n { print $2; exit }' "$RUN_DIR/roster" 2>/dev/null | grep .
+}
+
+# inject TEXT [PANE] — type TEXT into the target and submit it. Also reachable
+# as `claude-dictate --send [--to NAME|PANE] TEXT` so claude-listen can put a
+# voice-assembled transmission through the same path rather than reimplementing
+# these quirks. With no PANE it sends to the session's active pane, exactly as
+# it always has — the roster is opt-in.
+inject() {
+    local text="$1" pane="${2:-}" dest lock
+    if [[ -n "$pane" ]]; then
+        tmux display-message -t "$pane" -p '#{pane_id}' >/dev/null 2>&1 \
+            || die "no pane '$pane' — is the instance still alive?"
+        dest="$pane"
+        # Per-pane lock: instances receive independently — the delay below
+        # would otherwise make N instances take N sends' worth of wall clock.
+        lock="inject.${pane#%}.lock"
+    else
+        tmux has-session -t "=$TARGET" 2>/dev/null \
+            || die "no tmux session '$TARGET' — start one with: tmux new -s $TARGET claude"
+        dest="=$TARGET:"
+        lock="inject.lock"
+    fi
+
+    # Serialize senders: the delay below opens a window where a concurrent
+    # inject (a listener auto-send racing a hotkey dictation) would interleave
+    # its text between ours and our Enter, merging two prompts into one.
+    mkdir -p "$RUN_DIR"
+    exec 8>>"$RUN_DIR/$lock"
+    flock -w 30 8 || die "another dictation is mid-send"
+
+    # A pane scrolled back with the mouse is in copy mode, and send-keys then
+    # feeds each character to copy mode's key table instead of the prompt —
+    # the text vanishes (and the first bound key that cancels the mode makes
+    # the rest fail with "not in a mode"). Drop out of any mode first.
+    tmux copy-mode -q -t "$dest" 2>/dev/null
+
+    # tmux argv parsing eats a trailing unescaped ';' — escape it
+    [[ "$text" == *\; ]] && text="${text%;}\\;"
+    tmux send-keys -t "$dest" -l -- "$text" || die "tmux send-keys failed"
+
+    # The Enter must NOT ride along in the same tmux command. Chained, both
+    # land in one read and the TUI swallows the newline into the text it's
+    # still ingesting — the transcript sits in the prompt box unsent. Measured
+    # against a live session: chained never submits, a ~0.4s gap always does.
+    sleep "$SUBMIT_DELAY"
+    tmux send-keys -t "$dest" Enter || die "tmux send-keys failed"
+    exec 8>&-
+}
+
 main() {
+    if [[ "${1:-}" == "--send" ]]; then
+        shift
+        local pane=""
+        if [[ "${1:-}" == "--to" ]]; then
+            [[ -n "${2:-}" ]] || die "--to needs an instance name or pane id"
+            pane=$(resolve_pane "$2") || die "no instance '$2' in the roster"
+            shift 2
+        fi
+        [[ -n "${1:-}" ]] || exit 0
+        inject "$*" "$pane"
+        exit 0
+    fi
+
     command -v "$WHISPER" >/dev/null || die "whisper-cli not found — set DICTATE_WHISPER in $CONFIG_FILE"
     [[ -f "$MODEL" ]] || die "model not found — set DICTATE_MODEL in $CONFIG_FILE"
     mkdir -p "$RUN_DIR"
@@ -139,5 +221,5 @@ main() {
 
 # Run main unless we're being sourced (e.g. by the tests).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main
+    main "$@"
 fi

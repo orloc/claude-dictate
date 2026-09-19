@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# claude-mic — answer "which capture device is actually live?" and record from it.
+#
+# A headset can be more than one audio device. A wireless one is typically two:
+# the dongle is a card, and the headset's own USB audio is another card that
+# appears the moment you plug the charging cable in. Which one carries your
+# voice depends on how the headset is connected right now, and switching is a
+# physical act nobody wants to follow with a config edit.
+#
+# The trap is that the losing device does not fail. A dongle with no headset
+# behind it stays enumerated and streams perfect digital silence, so anything
+# pinned to it goes quietly deaf instead of erroring — a mic that records
+# nothing looks exactly like a room where nobody is talking. So the choice is
+# made by measurement, not by name: record a moment from each candidate and
+# take the first one whose samples are not all zero. That test also throws out
+# an S/PDIF input with nothing plugged into it, which is the usual reason the
+# system default source is the wrong answer.
+#
+#   claude-mic --resolve            print the live source's node name
+#   claude-mic --record ARGS...     exec pw-record on it, ARGS passed through
+#   claude-mic --show               print the resolution with its reasoning
+#
+# Config: env vars, or ~/.config/claude-dictate/config (shared with the other
+# scripts):
+#
+#   DICTATE_MIC_MATCH   extended regex the source name must match, so this
+#                       machine's real mic is picked over its webcam and its
+#                       loopbacks (default: any capture source)
+#   DICTATE_MIC_PROBE_MS  how long to sample each candidate (default: 400)
+#
+# The answer is published to $XDG_RUNTIME_DIR/claude-dictate/mic so the rest of
+# the suite can follow the mic without probing — claude-speak reads it to pick
+# the sink to play through, since the device you talk into is normally the
+# device you listen on.
+set -u
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+CACHE="$RUN_DIR/mic"
+CACHE_KEY="$RUN_DIR/mic.devices"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+fi
+
+MATCH="${DICTATE_MIC_MATCH:-.}"
+PROBE_MS="${DICTATE_MIC_PROBE_MS:-400}"
+[[ "$PROBE_MS" =~ ^[0-9]+$ ]] || PROBE_MS=400
+
+# Every capture source whose name matches, in PipeWire's own order. Monitors are
+# excluded: they carry what the speakers are playing, which would make the
+# listener transcribe its own voice.
+candidates() {
+    pactl list short sources 2>/dev/null \
+        | awk -v m="$MATCH" '$2 ~ /^alsa_input\./ && $2 !~ /\.monitor$/ && $2 ~ m {print $2}'
+}
+
+# The cache key is the candidate set itself. The right answer changes when a
+# device appears or disappears — plugging the cable in, pulling the dongle out —
+# and that is exactly when this string changes, so a hit is not merely fresh,
+# it is still true. Ordinary use therefore never pays for a probe.
+devices_key() { candidates | tr '\n' ' '; }
+
+# Live, in the only sense that matters: does it produce a sample that isn't
+# zero? A dead node's silence is *digital* — every byte is 0 — while a live
+# one's quietest room still carries converter noise, so the distinction is
+# robust without a threshold to tune. The first kilobyte is skipped because the
+# wav header is not audio and is never zero.
+is_live() {
+    local src="$1" tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/claude-mic.XXXXXX.wav") || return 1
+    timeout "$(( PROBE_MS / 1000 + 1 ))" \
+        pw-record --target "$src" --rate 16000 --channels 1 --format s16 "$tmp" \
+        >/dev/null 2>&1 &
+    local pid=$!
+    sleep "0.$(printf '%03d' "$PROBE_MS")"
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    local nonzero
+    nonzero=$(tail -c +1025 "$tmp" 2>/dev/null | tr -d '\0' | head -c1 | wc -c)
+    rm -f "$tmp"
+    [[ "$nonzero" != "0" ]]
+}
+
+# Is the published answer still usable? Split out because --record needs to know
+# whether resolving will measure, before it does.
+cache_valid() {
+    [[ -s "$CACHE" && -s "$CACHE_KEY" && "$(cat "$CACHE_KEY")" == "$1" ]] || return 1
+    # A cached name that has since vanished is not worth honouring even when the
+    # key matches — belt for a truncated or hand-edited cache.
+    grep -qxF "$(cat "$CACHE")" <<<"$(candidates)"
+}
+
+resolve() {
+    local key src
+    key=$(devices_key)
+    if cache_valid "$key"; then
+        cat "$CACHE"
+        return 0
+    fi
+
+    local first=""
+    while IFS= read -r src; do
+        [[ -n "$src" ]] || continue
+        [[ -n "$first" ]] || first="$src"
+        if is_live "$src"; then
+            publish "$src" "$key"
+            printf '%s' "$src"
+            return 0
+        fi
+    done < <(candidates)
+
+    # Nothing measured live: the headset is off, or pw-record is unavailable and
+    # every probe failed identically. Falling back to the first candidate keeps
+    # a recorder that would at least start, and beats resolving to nothing.
+    [[ -n "$first" ]] || return 1
+    publish "$first" "$key"
+    printf '%s' "$first"
+}
+
+publish() {
+    mkdir -p "$RUN_DIR" 2>/dev/null || return 0
+    printf '%s' "$1" > "$CACHE" 2>/dev/null
+    printf '%s' "$2" > "$CACHE_KEY" 2>/dev/null
+    return 0
+}
+
+# --forget drops the cache, so the next resolve measures again. The listener
+# calls this when its capture stream turns out to be silent: the devices may not
+# have changed, but the answer has.
+case "${1:-}" in
+    --resolve)
+        resolve || { echo "claude-mic: no capture source matches '$MATCH'" >&2; exit 1; }
+        echo
+        ;;
+    --record)
+        shift
+        measured=0; cache_valid "$(devices_key)" || measured=1
+        src=$(resolve) || { echo "claude-mic: no capture source matches '$MATCH'" >&2; exit 1; }
+        # Probing just held these devices open, and PipeWire releases a node a
+        # moment after its client lets go — a recorder starting inside that
+        # window can fail to bind, which upstream reads as a capture stream that
+        # died on arrival and retries with a backoff. Waiting out the gap is
+        # cheaper than the retry, and only the measuring path pays it.
+        (( measured )) && sleep 0.2
+        # node.dont-reconnect is the difference between a mic that fails and a
+        # mic that lies. Without it, a target node that goes away — a headset
+        # replugged, a device re-enumerated — does not kill the stream:
+        # PipeWire relinks it to the default source, which here is an S/PDIF
+        # input carrying nothing. Bytes then arrive at exactly real time and
+        # are not zeros, so neither a stalled-stream check nor a digital-silence
+        # check can see anything wrong, and the listener transcribes an empty
+        # wire indefinitely. Measured that way for thirteen minutes: the stream
+        # was healthy, and attached to Source 57 instead of the headset.
+        # With this, the node's disappearance ends the recorder, the caller
+        # rebuilds, and resolution runs again on whatever is live now.
+        exec pw-record --target "$src" -P '{ node.dont-reconnect = true }' "$@"
+        ;;
+    --forget)
+        rm -f "$CACHE" "$CACHE_KEY"
+        ;;
+    --show)
+        printf 'match:      %s\n' "$MATCH"
+        printf 'candidates: %s\n' "$(devices_key)"
+        printf 'cached:     %s\n' "$(cat "$CACHE" 2>/dev/null || echo '(none)')"
+        rm -f "$CACHE" "$CACHE_KEY"
+        for c in $(candidates); do
+            if is_live "$c"; then printf '  live      %s\n' "$c"
+            else printf '  SILENT    %s\n' "$c"; fi
+        done
+        printf 'resolved:   %s\n' "$(resolve)"
+        ;;
+    *)
+        cat >&2 <<'USAGE'
+usage: claude-mic [--resolve|--record ARGS...|--show|--forget]
+
+  --resolve   print the live capture source's node name
+  --record    exec pw-record on it; remaining args are passed through
+  --show      print the resolution and what each candidate measured
+  --forget    drop the cached answer, forcing the next resolve to measure
+USAGE
+        exit 2
+        ;;
+esac

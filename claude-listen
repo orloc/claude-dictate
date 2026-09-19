@@ -1,0 +1,973 @@
+#!/usr/bin/env bash
+# claude-listen — hands-free voice control for a Claude Code session.
+#
+# Replaces the dictate hotkey with a radio-style protocol. The mic is always
+# open, but nothing reaches Claude until you key up:
+#
+#   "<callsign>, come in"          open the mic
+#   ...say your thing...
+#   "... <callsign>, out"          send it
+#   "... <callsign>, disregard"    throw it away
+#   "<callsign>, silence"          stop a reply being read aloud
+#   "<callsign>, radio check"      hear the current state
+#   "<callsign>, help"             hear the protocol — a menu, since the
+#                                  command set no longer fits one breath
+#   "<callsign>, help basics"      the pages behind it: dictation,
+#   "<callsign>, help instances"   name-addressed instances, and the
+#   "<callsign>, help management"  callsign-only management verbs
+#
+# With named instances up (see claude-roster), an instance's name takes the
+# callsign's place and the callsign becomes the management channel:
+#
+#   "alpha, come in"  ... "alpha, out"       dictate to instance alpha
+#   "alpha, focus"                           make alpha the audible one
+#   "<callsign>, spawn"                      new named instance
+#   "<callsign>, list"                       who is up, who is focused
+#   "<callsign>, kill charlie"               kill an instance
+#   "<callsign>, rename bravo to alpha"      retarget a name
+#   "<callsign>, reap"                       drop hand-closed panes
+#   "<callsign>, status"                     same as radio check
+#
+# The commands that aim at a name take it either side of the verb: "alpha,
+# focus" and "focus alpha" are the same, as are "come in" and "silence". The
+# closing commands are the exception — see the note on POSITION below.
+#
+# Only the focused instance is audible; opening the mic to one focuses it.
+# With no instances the callsign works exactly as it always has.
+#
+# The safety of this comes from POSITION, not from picking a rare word — any
+# word you choose you will eventually say. A standalone command must be the
+# *entire* utterance, so "then Skylark comes in" can never fire it, and the
+# closing commands must be the *final* words of a transmission. That also means
+# no escape hatch is needed: you can talk about the commands freely. It is also
+# why "out" and "disregard" are not reversible: they alone match at the end of
+# speech that carries content, so the leading name is doing real work there.
+#
+# Config: env vars, or ~/.config/claude-dictate/config (shared with the other
+# scripts):
+#
+#   LISTEN_CALLSIGN    the callsign          (default: skylark)
+#   LISTEN_ALIASES     ;-separated extra spellings whisper might produce
+#                      (default covers what whisper has actually produced
+#                      for "skylark", including "Scarlett")
+#   LISTEN_POOL        instance names, space-separated
+#                      (default: alpha bravo charlie delta echo foxtrot)
+#   LISTEN_POOL_ALIASES  name:alias,alias;name:alias — whisper misspellings
+#                      per pool name (defaults built in)
+#   LISTEN_PROWORD_ALIASES  proword:alias,alias;… — what whisper produces for
+#                      a command word ("come in" → "command"). Defaults cover
+#                      the standalone prowords only: an alias for "out" or
+#                      "disregard" widens what can close a live transmission,
+#                      so those are yours to add.
+#   LISTEN_WHISPER_PROMPT  text whisper is primed with, biasing it toward the
+#                      callsign, names and prowords (default: built from
+#                      them; set empty to disable)
+#   LISTEN_MAX_TX      seconds of QUIET that close an unkeyed transmission
+#                      (default: 30 — this is a blast radius, not a
+#                      convenience. Whatever is audible when you forget to
+#                      say "out" gets dictated, so the number should be the
+#                      most room audio you are willing to send.)
+#   LISTEN_MAX_TX_TOTAL  hard ceiling on one transmission however much you
+#                      say (default: 900, 0 disables) — the runaway guard for
+#                      a room that never falls quiet
+#   LISTEN_MARGIN_DB   dB above the noise floor that counts as speech (12)
+#   LISTEN_MIN_DB      dBFS a frame must reach to open an utterance (-55) —
+#                      a quiet headset's floor sits far enough below typing
+#                      that the margin alone would wake whisper on keystrokes
+#   LISTEN_HANG_DB     how far below LISTEN_MIN_DB still keeps one open (10),
+#                      so a soft speaker's weak syllables don't split a
+#                      sentence into fragments whisper reads without context
+#   LISTEN_CLOSE_MS    silence that ends an utterance (700)
+#   LISTEN_VAD_MODEL   Silero VAD model whisper screens each utterance with
+#                      (default: the ggml-silero-*.bin beside DICTATE_MODEL;
+#                      set empty to disable). Without it whisper invents words
+#                      for a keystroke or a breath — and, primed with the
+#                      prowords, invents "alpha, out".
+#   LISTEN_DEAD_MS     digitally silent capture that means the device is gone
+#                      and the mic should be resolved again (20000)
+#   LISTEN_IDLE_RECHECK  seconds of hearing nothing at all after which the mic
+#                      is resolved again from scratch, in case the stream is
+#                      alive but attached to the wrong device (600, 0 disables)
+#
+# Reuses DICTATE_WHISPER / DICTATE_MODEL / DICTATE_RECORDER / DICTATE_TARGET;
+# claude-roster adds DICTATE_SPAWN_CMD for what a spawned pane runs.
+set -u
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen"
+TONE_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/tones"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.pid"
+LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.log"
+LISTEN_LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.lock"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+fi
+
+WHISPER="${DICTATE_WHISPER:-whisper-cli}"
+MODEL="${DICTATE_MODEL:-}"
+RECORDER="${DICTATE_RECORDER:-pw-record --rate 16000 --channels 1 --format s16}"
+TARGET="${DICTATE_TARGET:-claude}"
+CALLSIGN="${LISTEN_CALLSIGN:-skylark}"
+ALIASES="${LISTEN_ALIASES:-sky lark;skylar;sky clark;scarlett;scarlet;skylarke;sky lock;skylab;sly lark}"
+POOL="${LISTEN_POOL:-alpha bravo charlie delta echo foxtrot}"
+POOL_ALIASES="${LISTEN_POOL_ALIASES:-alpha:alfa;bravo:brava,brovo;charlie:charley,charly;echo:eco,ecko;foxtrot:fox trot,foxtrott,fox trott}"
+PROWORD_ALIASES="${LISTEN_PROWORD_ALIASES:-come in:command,come on,coming,come an,comin;silence:silent,silents,science;radio check:radio cheque,radio checks;disregard:;out:}"
+MAX_TX="${LISTEN_MAX_TX:-30}"
+MAX_TX_TOTAL="${LISTEN_MAX_TX_TOTAL:-900}"
+MARGIN_DB="${LISTEN_MARGIN_DB:-12}"
+MIN_DB="${LISTEN_MIN_DB:--55}"
+HANG_DB="${LISTEN_HANG_DB:-10}"
+CLOSE_MS="${LISTEN_CLOSE_MS:-700}"
+DEAD_MS="${LISTEN_DEAD_MS:-20000}"
+IDLE_RECHECK="${LISTEN_IDLE_RECHECK:-600}"
+ROSTER_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/roster"
+
+# One spoken-form → canonical-name map covering the callsign and every pool
+# name. Aliases exist because whisper will occasionally split or mangle a
+# proper noun; the whole-utterance rule keeps the extra surface from
+# mattering. The grammar matches spoken forms; everything downstream of it
+# sees only canonical names.
+declare -A NAME_OF=(["$CALLSIGN"]="$CALLSIGN")
+while IFS= read -r -d ';' a; do [[ -n "$a" ]] && NAME_OF["$a"]="$CALLSIGN"; done <<<"$ALIASES;"
+for _n in $POOL; do NAME_OF["$_n"]="$_n"; done
+while IFS= read -r -d ';' _entry; do
+    [[ "$_entry" == *:* ]] || continue
+    _n="${_entry%%:*}"
+    [[ " $POOL " == *" $_n "* ]] || continue
+    while IFS= read -r -d ',' _a; do [[ -n "$_a" ]] && NAME_OF["$_a"]="$_n"; done <<<"${_entry#*:},"
+done <<<"$POOL_ALIASES;"
+unset _n _a _entry
+
+# Spoken phrase -> action, valid after any name. Kept small and closed on
+# purpose: a large command vocabulary is a large accidental-trigger surface.
+# "focus" is instance-only (focusing the callsign means nothing) and is
+# filtered in the matcher.
+declare -A PROWORDS=(
+    ["come in"]=open
+    ["out"]=close
+    ["disregard"]=cancel
+    ["silence"]=hush
+    ["radio check"]=status
+    ["help"]=help
+    ["focus"]=focus
+)
+# Management verbs, valid after the callsign only. kill and rename are
+# handled apart from this table — no proword takes an argument.
+declare -A MGMT=(
+    ["spawn"]=spawn
+    ["list"]=list
+    ["status"]=status
+    ["reap"]=reap
+)
+# Spoken form → proword, the same shape as NAME_OF. Every proword maps to
+# itself; aliases only ever add spellings, never verbs.
+declare -A PW_OF=()
+for _pw in "${!PROWORDS[@]}"; do PW_OF["$_pw"]="$_pw"; done
+while IFS= read -r -d ';' _entry; do
+    [[ "$_entry" == *:* ]] || continue
+    _pw="${_entry%%:*}"
+    [[ -n "${PROWORDS[$_pw]:-}" ]] || continue
+    while IFS= read -r -d ',' _a; do [[ -n "$_a" ]] && PW_OF["$_a"]="$_pw"; done <<<"${_entry#*:},"
+done <<<"$PROWORD_ALIASES;"
+unset _pw _a _entry
+
+# Help submenus. The top level is a menu; these are the pages. Spellings
+# whisper actually produces are folded in, same as the name aliases — an
+# unknown page is not a command at all, which keeps "$c, help me out here"
+# from firing anything.
+declare -A HELP_TOPICS=(
+    [basics]=basics [basic]=basics [dictation]=basics [protocol]=basics
+    [instances]=instances [instance]=instances [names]=instances
+    [management]=management [manage]=management [admin]=management
+)
+
+# canon_topic(spoken) — a known help page, or fail.
+canon_topic() {
+    local t="${HELP_TOPICS[$1]:-}"
+    [[ -n "$t" ]] || return 1
+    printf '%s' "$t"
+}
+
+# Only these may appear at the end of a real transmission; the rest are
+# standalone-only, which is what keeps them out of dictated prose.
+TERMINAL=(out disregard)
+# Prowords that read naturally either way round: "bravo, focus" and "focus
+# bravo" are the same instruction. Deliberately disjoint from TERMINAL — a
+# terminal proword matches at the END of an utterance carrying dictated
+# content, and the leading name is the only thing keeping "...pull the plug
+# out, bravo" in dictated prose from closing the mic. Reversing those would
+# throw that guard away; these are standalone-only, so they cannot fire
+# mid-transmission at all.
+DIRECTIONAL=(focus "come in" silence)
+
+# ------------------------------------------------------------------ grammar --
+
+# Fold a transcript to bare words so punctuation and casing can't affect a
+# match: "Skylark, come in." and "skylark come in" are the same command.
+normalize() {
+    tr '[:upper:]' '[:lower:]' \
+        | sed -E "s/[^a-z0-9 ]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//"
+}
+
+# collapse_repeat(norm) — "alpha silence alpha silence alpha silence" →
+# "alpha silence". Whisper stacks a short phrase said once (or said again
+# after no answer) into one utterance; in standby that is either one command
+# or nothing, so the smallest phrase the utterance is a whole multiple of is
+# what was meant. Dictation is never collapsed — repetition there is content.
+collapse_repeat() {
+    local -a w
+    local n k i
+    read -ra w <<<"$1"
+    n=${#w[@]}
+    for ((k = 1; k <= n / 2; k++)); do
+        (( n % k == 0 )) || continue
+        for ((i = k; i < n; i++)); do [[ "${w[i]}" == "${w[i % k]}" ]] || continue 2; done
+        printf '%s' "${w[*]:0:k}"
+        return 0
+    done
+    printf '%s' "$1"
+}
+
+# canon_name(spoken) — resolve a command's ARGUMENT through the alias map.
+# Unknown spellings pass through unresolved, so the error can name what was
+# actually heard.
+canon_name() { printf '%s' "${NAME_OF[$1]:-$1}"; }
+
+is_terminal() {
+    local t
+    for t in "${TERMINAL[@]}"; do [[ "$t" == "$1" ]] && return 0; done
+    return 1
+}
+
+# is_directional(proword) — may it be spoken verb-first?
+is_directional() {
+    local d
+    for d in "${DIRECTIONAL[@]}"; do [[ "$d" == "$1" ]] && return 0; done
+    return 1
+}
+
+# Echo "name<TAB>action[<TAB>arg[<TAB>arg]]" when the WHOLE utterance is a
+# command: "<name>, <proword>", or a management command on the callsign.
+# Anything else — a longer sentence that merely contains the phrase — is not
+# a command.
+standalone_command() {
+    local n="$1" cs sp pw name rest topic
+    for cs in "${!NAME_OF[@]}"; do
+        name="${NAME_OF[$cs]}"
+        for sp in "${!PW_OF[@]}"; do
+            pw="${PW_OF[$sp]}"
+            if [[ "$n" != "$cs $sp" ]]; then
+                # Verb-first, for directional prowords only. The target is
+                # still guarded: $cs ranges over known spoken names, so
+                # "focus bravo" matches and "focus the parser" cannot.
+                is_directional "$pw" && [[ "$n" == "$sp $cs" ]] || continue
+            fi
+            [[ "$pw" == focus && "$name" == "$CALLSIGN" ]] && continue
+            printf '%s\t%s' "$name" "${PROWORDS[$pw]}"
+            return 0
+        done
+        [[ "$name" == "$CALLSIGN" ]] || continue
+        for pw in "${!MGMT[@]}"; do
+            [[ "$n" == "$cs $pw" ]] && { printf '%s\t%s' "$name" "${MGMT[$pw]}"; return 0; }
+        done
+        # The two commands that take arguments. Still whole-utterance: a
+        # prefix match here is only reached when the utterance STARTS with
+        # the callsign, and the argument is everything after the verb.
+        if [[ "$n" == "$cs help "* ]]; then
+            topic=$(canon_topic "${n#"$cs help "}") || continue
+            printf '%s\thelp\t%s' "$name" "$topic"
+            return 0
+        fi
+        if [[ "$n" == "$cs kill "* ]]; then
+            printf '%s\tkill\t%s' "$name" "$(canon_name "${n#"$cs kill "}")"
+            return 0
+        fi
+        if [[ "$n" == "$cs rename "* ]]; then
+            rest="${n#"$cs rename "}"
+            [[ "$rest" == *" to "* ]] || continue
+            printf '%s\trename\t%s\t%s' "$name" \
+                "$(canon_name "${rest%% to *}")" "$(canon_name "${rest#* to }")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Echo "name<TAB>action<TAB>remainder" when the utterance ENDS with a name +
+# closing proword. The closing commands have to live here because they
+# necessarily terminate a transmission that carries content — they can't be
+# standalone.
+terminal_command() {
+    local n="$1" cs sp pw name suffix rest
+    for cs in "${!NAME_OF[@]}"; do
+        name="${NAME_OF[$cs]}"
+        for sp in "${!PW_OF[@]}"; do
+            pw="${PW_OF[$sp]}"
+            is_terminal "$pw" || continue
+            suffix="$cs $sp"
+            if [[ "$n" == "$suffix" || "$n" == *" $suffix" ]]; then
+                rest="${n%"$suffix"}"
+                rest="${rest% }"
+                printf '%s\t%s\t%s' "$name" "${PROWORDS[$pw]}" "$rest"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------- audio -
+
+# Short distinct tones rather than spoken confirmations: you hear these dozens
+# of times an hour and you're not looking at the screen.
+# The stamp, rather than "does tone-open.wav exist": these are generated once
+# and then cached forever, so a change to how they sound would never reach
+# anyone who had already run an older version. Bump it when the tones change.
+TONE_STAMP=3
+
+make_tones() {
+    [[ -f "$TONE_DIR/.generated-$TONE_STAMP" ]] && return 0
+    mkdir -p "$TONE_DIR"
+    python3 - "$TONE_DIR" <<'PY'
+import math, struct, sys, wave
+# 48 kHz because that is what these sinks run at, and half a second of silence
+# in front of every tone because a USB sink suspends when idle and takes a few
+# hundred milliseconds to resume — during which samples go nowhere. A state tone
+# is 160 ms long, so it was being swallowed whole.
+#
+# Both numbers are from an A/B against a live headset, not from theory: the same
+# two-note beep was inaudible at 16 kHz with 240 ms of lead-in and audible at
+# 48 kHz with 500 ms, played to the same sink seconds apart. Matching the sink's
+# rate also keeps a resampler out of a path that has to work from cold.
+RATE = 48000
+LEAD_MS = 500
+
+def tone(path, steps):
+    frames = bytearray(2 * (RATE * LEAD_MS // 1000))
+    for freq, ms, amp in steps:
+        n = RATE * ms // 1000
+        for i in range(n):
+            # taper the edges so the tone doesn't click
+            env = min(1.0, i / (RATE * 0.008), (n - i) / (RATE * 0.008))
+            v = int(amp * env * 32767 * math.sin(2 * math.pi * freq * i / RATE))
+            frames += struct.pack("<h", v)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+        w.writeframes(bytes(frames))
+d = sys.argv[1]
+tone(f"{d}/tone-open.wav",  [(660, 70, .35), (990, 90, .35)])
+tone(f"{d}/tone-close.wav", [(990, 70, .35), (660, 90, .35)])
+tone(f"{d}/tone-ack.wav",   [(880, 60, .30)])
+tone(f"{d}/tone-abort.wav", [(660, 60, .30), (520, 60, .30), (390, 90, .30)])
+tone(f"{d}/tone-err.wav",   [(200, 180, .30)])
+tone(f"{d}/tone-on.wav",    [(520, 60, .30), (660, 60, .30), (880, 90, .30)])
+tone(f"{d}/tone-off.wav",   [(880, 60, .30), (660, 60, .30), (440, 110, .30)])
+PY
+    : > "$TONE_DIR/.generated-$TONE_STAMP"
+}
+
+# Every child of the listener is spawned with 8>&-. Fd 8 is the singleton
+# lock, and its flock lives as long as ANY process holding that descriptor —
+# so one long-lived grandchild is enough to hold it forever. That is not
+# hypothetical: `roster spawn` runs a tmux client, the client forked a tmux
+# server, the server inherited fd 8 and sat on it, and from then on every
+# listener refused to start because a corpse "was already running". Short-
+# lived children can't cause it, but they're closed too — the rule is easier
+# to keep than the exception.
+tone() { "$HERE/claude-speak" --play "$TONE_DIR/tone-$1.wav" 2>/dev/null 8>&- & }
+speak() { printf '%s' "$1" | "$HERE/claude-speak" 8>&-; }
+
+# Spoken, not printed. Three things follow from that and shape every line
+# below:
+#
+#   - You cannot skim audio. The old single block was 135 words — about a
+#     minute with no way to jump to the part you wanted. So help is a menu:
+#     the top level is the four things you need to talk at all, plus the
+#     names of the pages.
+#   - One clause per sentence. A period is the only reliable pause; commas
+#     inside a command ("rename, old name, to, new name") come out as a
+#     stutter, and a placeholder read aloud sounds like a word you should
+#     have said. Real names instead.
+#   - Say nothing about instances until instances exist. The top level asks
+#     the roster.
+help_text() {
+    local c="$CALLSIGN" page="${1:-}"
+    case "$page" in
+        basics)
+            printf '%s' "Basics. \
+To open the mic, say $c, come in. \
+Then talk normally. \
+To send what you said, finish with $c, out. \
+To throw it away instead, finish with $c, disregard. \
+While the mic is closed, say $c, silence, to stop me talking. \
+Say $c, radio check, to hear the current state. \
+A command only counts when it is the whole thing you said. \
+So you can talk about these words without setting them off."
+            ;;
+        instances)
+            printf '%s' "Instances. \
+When instances are up, the name goes where the callsign would. \
+Say alpha, come in. \
+Then alpha, out. \
+Say alpha, focus, to make alpha the one you hear. \
+The name can go either side of the verb. \
+So focus alpha works too. \
+Opening the mic to an instance focuses it too. \
+Only the focused instance is audible."
+            ;;
+        management)
+            printf '%s' "Management. \
+These all start with $c. \
+Say $c, spawn, for a new instance. \
+Say $c, list, to hear who is up. \
+Say $c, kill, then a name. \
+Say $c, rename bravo to alpha, to move a name. \
+Say $c, reap, to drop instances you closed by hand. \
+And $c, status, does the same as radio check."
+            ;;
+        *)
+            local out="Radio protocol. \
+To open the mic, say $c, come in. \
+Then talk normally. \
+To send it, finish with $c, out. \
+To throw it away, finish with $c, disregard."
+            if [[ -n "$(roster list 2>/dev/null)" ]]; then
+                out="$out An instance name works the same way. \
+Say alpha, come in. \
+And alpha, focus, makes alpha the one you hear."
+            fi
+            printf '%s' "$out For more, say $c, help, basics. \
+Or $c, help, instances. \
+Or $c, help, management."
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------- run --
+
+STATE=standby
+BUFFER=""
+TX_START=0
+TX_LAST=0        # when the open transmission last heard a word (see check_timeout)
+TX_TARGET=""     # canonical name the open transmission belongs to
+
+log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
+
+# A sleep that SIGTERM can cut short. `sleep` is an external command, and bash
+# defers a trapped signal until the foreground child exits — so waiting out a
+# backoff with a plain sleep makes --stop look broken for as long as the wait,
+# and the listener holds its singleton lock the whole time. `wait` is a builtin,
+# and a builtin returns the moment the signal lands, so the EXIT trap runs then
+# rather than up to a minute later.
+nap() {
+    local pid
+    sleep "$1" & pid=$!
+    wait "$pid" 2>/dev/null
+    kill "$pid" 2>/dev/null
+    return 0
+}
+
+# The prompt primes whisper's decoder with the vocabulary it will hear most,
+# which is how a proper noun like the callsign stops coming back as
+# "Scarlett". Checked against silence and pink/brown noise: the prompt is not
+# echoed back, the hallucinations stay the usual "you"/"thank you".
+default_prompt() {
+    local out="" n _first="${POOL%% *}"
+    for n in $CALLSIGN $POOL; do out+="${out:+ }${n^}, come in. ${n^}, out."; done
+    printf '%s %s, radio check. %s, silence. %s, disregard. %s, focus. %s, help.' \
+        "$out" "${CALLSIGN^}" "${CALLSIGN^}" "${CALLSIGN^}" "${_first^}" "${CALLSIGN^}"
+}
+WHISPER_PROMPT="${LISTEN_WHISPER_PROMPT-$(default_prompt)}"
+
+# The energy gate cannot tell a knock from a word, and whisper given a knock
+# does not return nothing — it returns "Thank you.", or with the prompt above,
+# a proword. Silero VAD inside whisper screens the audio first, so non-speech
+# transcribes as empty and never reaches the state machine.
+default_vad_model() {
+    local f
+    for f in "$(dirname "$MODEL")"/ggml-silero*.bin; do
+        [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    return 0
+}
+VAD_MODEL="${LISTEN_VAD_MODEL-$(default_vad_model)}"
+[[ -n "$VAD_MODEL" && ! -f "$VAD_MODEL" ]] && { echo "VAD model not found: $VAD_MODEL — running without it" >&2; VAD_MODEL=""; }
+
+transcribe() {
+    "$WHISPER" -m "$MODEL" -f "$1" --no-prints --no-timestamps --suppress-nst \
+        ${WHISPER_PROMPT:+--prompt "$WHISPER_PROMPT"} \
+        ${VAD_MODEL:+--vad -vm "$VAD_MODEL"} \
+        2>/dev/null 8>&- | tr '\n' ' ' 8>&- | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' 8>&-
+}
+
+# All roster traffic funnels through one seam, so the tests can fake the
+# roster without a tmux server.
+roster() { "$HERE/claude-roster" "$@" 8>&-; }
+
+send_buffer() {
+    local text="$1"
+    [[ -n "$text" ]] || { tone err; notify critical 3000 "nothing to send"; return 0; }
+    local -a to=()
+    [[ -n "$TX_TARGET" && "$TX_TARGET" != "$CALLSIGN" ]] && to=(--to "$TX_TARGET")
+    if "$HERE/claude-dictate" --send "${to[@]}" "$text" 8>&-; then
+        log "sent${to[1]:+ to ${to[1]}}: $text"
+        notify normal 5000 "➜ $text"
+    else
+        notify critical 5000 "could not reach ${to[1]:-the '$TARGET' tmux session}"
+    fi
+}
+
+# ----------------------------------------------------------- voice commands --
+
+# "Two. alpha, focused. bravo." — what "list" speaks.
+list_text() {
+    local lines n out name pane foc
+    lines=$(roster list 2>/dev/null)
+    [[ -n "$lines" ]] || { printf 'No instances.'; return 0; }
+    n=$(grep -c . <<<"$lines")
+    out="$n."
+    while IFS=$'\t' read -r name pane foc; do
+        [[ -n "$name" ]] || continue
+        if [[ "$foc" == focused ]]; then out="$out $name, focused."; else out="$out $name."; fi
+    done <<<"$lines"
+    printf '%s' "$out"
+}
+
+status_text() {
+    local roster_part
+    roster_part=$(list_text)
+    if [[ "$roster_part" == "No instances." ]]; then printf 'Standing by.'
+    else printf 'Standing by. %s' "$roster_part"; fi
+}
+
+cmd_open() {
+    local who="$1"
+    if [[ "$who" == "$CALLSIGN" ]]; then
+        # The callsign opens the mic only while no instances exist — that's
+        # the whole single-pane setup, unchanged. With a roster up it would
+        # be ambiguous which claude you meant.
+        if [[ -n "$(roster list 2>/dev/null)" ]]; then
+            tone err; log "callsign open refused: instances are up"
+            notify critical 4000 "instances are up — open one by name"
+            return 0
+        fi
+    else
+        if ! roster pane "$who" >/dev/null 2>&1; then
+            tone err; log "open refused: no instance $who"
+            notify critical 4000 "no instance $who — say \"$CALLSIGN, spawn\""
+            return 0
+        fi
+        # Opening the mic to an instance makes it the audible one.
+        roster focus "$who" >/dev/null 2>&1
+    fi
+    TX_TARGET="$who"
+    STATE=transmitting; BUFFER=""; TX_START=$SECONDS; TX_LAST=$SECONDS
+    tone open; log "mic open for $who"
+    notify low 90000 "🔴 mic open ($who) — \"$who, out\" to send"
+}
+
+cmd_focus() {
+    local who="$1"
+    if roster focus "$who" >/dev/null 2>&1; then
+        tone ack; log "focused $who"
+        notify low 3000 "focused $who"
+    else
+        tone err
+        notify critical 4000 "no instance $who"
+    fi
+}
+
+cmd_spawn() {
+    local out name
+    if out=$(roster spawn 2>&1); then
+        name="${out%%$'\t'*}"
+        tone ack; log "spawned $name"
+        speak "$name up."
+        notify normal 4000 "spawned $name"
+    else
+        tone err; log "spawn failed: $out"
+        speak "Spawn failed."
+        notify critical 5000 "spawn failed: $out"
+    fi
+}
+
+cmd_kill() {
+    local who="$1"
+    if roster kill "$who" >/dev/null 2>&1; then
+        tone ack; log "killed $who"
+        speak "$who down."
+        notify normal 4000 "killed $who"
+    else
+        tone err
+        notify critical 4000 "no instance $who"
+    fi
+}
+
+cmd_rename() {
+    local old="$1" new="$2"
+    if roster rename "$old" "$new" >/dev/null 2>&1; then
+        tone ack; log "renamed $old to $new"
+        speak "$old is now $new."
+        notify normal 4000 "renamed $old to $new"
+    else
+        tone err
+        notify critical 4000 "cannot rename $old to $new"
+    fi
+}
+
+cmd_reap() {
+    local dropped n
+    dropped=$(roster reap 2>/dev/null)
+    n=$(grep -c . <<<"$dropped")
+    if (( n == 0 )); then
+        tone ack; speak "Roster clean."
+    else
+        tone ack; log "reaped: $(tr '\n' ' ' <<<"$dropped")"
+        speak "Reaped $(paste -sd', ' <<<"$dropped")."
+        notify normal 4000 "reaped $(paste -sd', ' <<<"$dropped")"
+    fi
+}
+
+handle() {
+    local wav="$1" text norm out who act a1 a2 rest s
+    text=$(transcribe "$wav")
+    rm -f "$wav"
+    norm=$(normalize <<<"$text")
+    # Log before the empty check: "whisper returned nothing" is exactly the
+    # case you need to see when the thing appears to ignore you.
+    log "heard [$STATE]: \"$text\" -> \"$norm\""
+    [[ -n "$norm" ]] || return 0
+    # Something was said, so the transmission is still alive — the quiet
+    # ceiling measures from here, not from when the mic opened. Empty
+    # transcriptions deliberately don't count: room noise that whisper hears
+    # no words in shouldn't be able to hold the channel open.
+    [[ "$STATE" == transmitting ]] && TX_LAST=$SECONDS
+
+    if [[ "$STATE" == standby ]]; then
+        # In standby nothing is dictation — an utterance is either a command
+        # or it is ignored outright.
+        out=$(standalone_command "$(collapse_repeat "$norm")") || { log "ignored: $norm"; return 0; }
+        IFS=$'\t' read -r who act a1 a2 <<<"$out"
+        case "$act" in
+            open)   cmd_open "$who" ;;
+            hush)   "$HERE/claude-speak" --stop 8>&-; tone ack
+                    notify low 2000 "stopped speaking" ;;
+            status) s=$(status_text); speak "$s"; notify low 3000 "$s" ;;
+            help)   speak "$(help_text "$a1")"
+                    notify low 6000 "reading out the protocol${a1:+: $a1}" ;;
+            focus)  cmd_focus "$who" ;;
+            spawn)  cmd_spawn ;;
+            list)   s=$(list_text); speak "$s"; notify low 5000 "$s" ;;
+            reap)   cmd_reap ;;
+            kill)   cmd_kill "$a1" ;;
+            rename) cmd_rename "$a1" "$a2" ;;
+            close|cancel) tone err; log "close command with mic already shut"
+                    notify critical 3000 "mic is already closed" ;;
+        esac
+        return 0
+    fi
+
+    if out=$(terminal_command "$norm"); then
+        IFS=$'\t' read -r who act rest <<<"$out"
+        # A close addressed to the wrong name is a mistake worth hearing
+        # about, not a silent redirect of the whole transmission.
+        if [[ "$who" != "$TX_TARGET" ]]; then
+            tone err; log "close addressed to $who but the mic is open for $TX_TARGET"
+            notify critical 4000 "mic is open for $TX_TARGET — close with \"$TX_TARGET, out\""
+            return 0
+        fi
+        case "$act" in
+            close)  [[ -n "$rest" ]] && BUFFER="${BUFFER:+$BUFFER }$rest"
+                    STATE=standby; tone close
+                    send_buffer "$BUFFER"; BUFFER=""; TX_TARGET="" ;;
+            cancel) STATE=standby; BUFFER=""; TX_TARGET=""; tone abort; log "discarded"
+                    notify normal 2500 "discarded" ;;
+        esac
+        return 0
+    fi
+
+    BUFFER="${BUFFER:+$BUFFER }$text"
+    log "buffered: $text"
+    # Echo the transmission as it builds, so you can see it heard you right
+    # without waiting until after it's been sent.
+    notify low 90000 "🔴 $BUFFER"
+}
+
+# One utterance's worth of work. handle() and check_timeout() belong on the
+# same path and in this order: the total ceiling exists for a transmission
+# nobody closed, and speech arriving is exactly the condition under which that
+# happens. Checking it only when the room falls quiet — which is what the read
+# loop used to do — leaves a conversation or a speakerphone free to hold the
+# channel open indefinitely. The order also means handle() has already
+# refreshed the quiet clock by the time we look, so a caller on this path can
+# only ever trip the total ceiling, never the silence one.
+pump() {
+    handle "$1"
+    check_timeout
+}
+
+# A missed "out" would otherwise hold the channel open forever, so a long
+# transmission closes and sends itself rather than being lost.
+#
+# The clock that decides this is the one since you last said something, not
+# the one since the mic opened. Timing the whole transmission cut long
+# dictation off mid-thought, and the cut is worse than it sounds: everything
+# said afterwards arrives in standby, where an utterance that isn't a command
+# is discarded outright. One number too small made the thing interrupt you and
+# then go deaf. Quiet is the actual evidence that you walked away without
+# keying out, so MAX_TX times silence.
+#
+# MAX_TX_TOTAL is the backstop for what quiet can't catch — a conversation or
+# a speakerphone that keeps feeding the buffer and never lets the idle clock
+# run. It has to exist, or an idle clock that speech keeps resetting never
+# fires at all; it sits far above any one dictation so it only ever catches a
+# runaway. 0 disables it.
+check_timeout() {
+    [[ "$STATE" == transmitting ]] || return 0
+    local why
+    if (( SECONDS - TX_LAST >= MAX_TX )); then
+        why="${MAX_TX}s of quiet with the mic open"
+    elif (( MAX_TX_TOTAL > 0 && SECONDS - TX_START >= MAX_TX_TOTAL )); then
+        why="${MAX_TX_TOTAL}s transmission ceiling"
+    else
+        return 0
+    fi
+    log "$why — sending"
+    notify normal 4000 "$why — sending"
+    STATE=standby; tone close
+    send_buffer "$BUFFER"; BUFFER=""; TX_TARGET=""
+}
+
+# ------------------------------------------------------------------ control --
+
+# notify(urgency, timeout_ms, body). Same shape as claude-dictate's.
+#
+# The listener's notifications describe one changing thing — what the mic is
+# doing right now — so they replace each other in place rather than stacking a
+# column of stale state. The id comes from the daemon (-p) instead of being
+# hardcoded, so we can't collide with another app's notification.
+NOTIFY_ID=""
+notify() {
+    command -v notify-send >/dev/null || return 0
+    local args=(-u "$1" -t "$2") id
+    [[ -n "$NOTIFY_ID" ]] && args+=(-r "$NOTIFY_ID")
+    id=$(notify-send -p "${args[@]}" "claude-listen" "$3" 2>/dev/null) && NOTIFY_ID="$id"
+    return 0
+}
+
+# Echo the running listener's pid, or fail. A pidfile left behind by a crash
+# names nothing, so liveness is checked rather than assumed.
+listener_pid() {
+    local p
+    p=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    printf '%s' "$p"
+}
+
+start_listener() {
+    if listener_pid >/dev/null; then
+        notify low 2000 "already listening"
+        return 0
+    fi
+    mkdir -p "$(dirname "$PIDFILE")"
+    make_tones
+    : > "$LOGFILE"
+    setsid --fork "$0" --run >>"$LOGFILE" 2>&1 </dev/null
+    tone on
+    notify low 4000 "listening — say \"$CALLSIGN, come in\""
+}
+
+stop_listener() {
+    local p
+    p=$(listener_pid) || { notify low 2000 "not listening"; return 0; }
+    kill -TERM "$p" 2>/dev/null
+    tone off
+    notify low 3000 "stopped listening"
+}
+
+status_listener() {
+    local p
+    if p=$(listener_pid); then echo "listening (pid $p)"; else echo "not listening"; fi
+}
+
+# ---------------------------------------------------------------------- main --
+
+cleanup() {
+    pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
+    pkill -P $$ 2>/dev/null
+    rm -rf "$RUN_DIR"
+    [[ "$(cat "$PIDFILE" 2>/dev/null)" == "$$" ]] && rm -f "$PIDFILE"
+    return 0
+}
+
+open_stream() {
+    # 8>&- matters: the singleton lock is fd 8, and a child that inherits it
+    # keeps the lock held after the listener dies — a recorder lingering for
+    # even a few seconds would make an immediate restart claim "already
+    # running" against a corpse.
+    exec 3< <($RECORDER - 2>/dev/null 8>&- \
+        | python3 "$HERE/listen-segmenter.py" --outdir "$RUN_DIR" \
+              --margin-db "$MARGIN_DB" --min-db "$MIN_DB" --hang-db "$HANG_DB" \
+              --close-ms "$CLOSE_MS" \
+              --dead-ms "$DEAD_MS" 8>&-)
+}
+
+close_stream() {
+    exec 3<&-
+    pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
+    return 0
+}
+
+run_listener() {
+    command -v "$WHISPER" >/dev/null || { echo "whisper-cli not found" >&2; exit 1; }
+    [[ -f "$MODEL" ]] || { echo "model not found — set DICTATE_MODEL" >&2; exit 1; }
+    command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
+    command -v "${RECORDER%% *}" >/dev/null \
+        || { echo "recorder not found: ${RECORDER%% *} — set DICTATE_RECORDER" >&2; exit 1; }
+
+    # Exactly one listener, enforced by a lock rather than a pidfile check: two
+    # instances share the mic, the fixed RUN_DIR, and the pkill pattern, so the
+    # second double-sends every utterance and either one's cleanup destroys the
+    # other. The lock is held for life; a double --toggle's racing children
+    # settle here (the loser exits before touching anything shared), and a
+    # foreground --run beside a background listener is refused the same way.
+    mkdir -p "$(dirname "$LISTEN_LOCK")"
+    exec 8>>"$LISTEN_LOCK"
+    if ! flock -n 8; then
+        echo "another listener is already running" >&2
+        exit 1
+    fi
+
+    rm -rf "$RUN_DIR"; mkdir -p "$RUN_DIR" "$(dirname "$PIDFILE")"
+    echo $$ > "$PIDFILE"
+    make_tones
+    log "listening — say \"$CALLSIGN, come in\" to key up (\"$CALLSIGN, help\" for the protocol)"
+    [[ -n "$VAD_MODEL" ]] || log "no VAD model — whisper will hallucinate words on noise (see LISTEN_VAD_MODEL)"
+
+    # SIGTERM is how --stop arrives, and bash won't run an EXIT trap for it
+    # unless the signal is trapped too — otherwise the segmenter outlives us.
+    trap 'cleanup; exit 0' TERM INT
+    trap cleanup EXIT
+
+    # The segmenter's stdout becomes fd 3: one utterance path per line. Only
+    # one listener can exist (the lock above), so the pkill in cleanup targets
+    # our segmenter alone; the recorder then dies of SIGPIPE when it goes.
+    # $RECORDER is a word-split command by design (same contract as
+    # claude-dictate); "-" makes pw-record stream to stdout.
+    open_stream
+    local stream_up=$SECONDS backoff=1 dead_streak=0 last_heard=$SECONDS
+
+    # Read utterances as they close, with a periodic tick so the transmission
+    # timeout still fires while nobody is saying anything.
+    local wav st
+    while true; do
+        if read -r -t 5 wav <&3; then
+            # The segmenter's one non-path line. The device is enumerated and
+            # streaming, so nothing errored and nothing will — it is simply
+            # sending zeros, because the headset moved to its other card or
+            # went to sleep. Drop the resolved mic and rebuild: claude-mic
+            # measures again, and the stream comes back on whichever device is
+            # actually live. Nothing else can notice this; a silent mic and a
+            # silent room are the same thing to every threshold we have.
+            if [[ "$wav" == "!dead" ]]; then
+                dead_streak=$(( dead_streak + 1 ))
+                log "capture is digital silence — re-resolving the mic (attempt $dead_streak)"
+                # Only the first one is worth interrupting you for. A headset
+                # that is simply switched off is silent on every device, so the
+                # streak would otherwise post a critical notification every
+                # dead-ms until you noticed the thing you already know.
+                (( dead_streak == 1 )) && notify critical 4000 "mic went silent — switching device"
+                [[ -x "$HERE/claude-mic" ]] && "$HERE/claude-mic" --forget 8>&-
+                close_stream
+                # Switching devices should be instant, but a mic that is silent
+                # because nothing is turned on will be silent again next time —
+                # so a repeat backs off instead of probing in a loop forever.
+                (( dead_streak > 1 )) && nap $(( dead_streak > 6 ? 30 : 5 ))
+                open_stream
+                stream_up=$SECONDS
+                continue
+            fi
+            if [[ -f "$wav" ]]; then
+                # Audio again: whatever we switched to is carrying sound, so the
+                # next silence is a fresh event and gets told about.
+                dead_streak=0
+                last_heard=$SECONDS
+                pump "$wav"
+            fi
+        else
+            st=$?
+            if (( st > 128 )); then
+                check_timeout
+                # The belt for a stream that is alive, non-zero, and wrong. A
+                # node that disappears should now end the recorder outright
+                # (claude-mic asks for node.dont-reconnect), but PipeWire moving
+                # a capture stream to some other device is invisible from here:
+                # a wrong device and a quiet room produce exactly the same
+                # nothing. So after long enough of hearing NOTHING, stop
+                # trusting the stream and resolve the mic from scratch. A quiet
+                # room pays a second of rebuilding; a wrong device gets fixed.
+                if (( IDLE_RECHECK > 0 && SECONDS - last_heard >= IDLE_RECHECK )) \
+                   && [[ "$STATE" == standby ]]; then
+                    log "nothing heard in ${IDLE_RECHECK}s — re-resolving the mic"
+                    [[ -x "$HERE/claude-mic" ]] && "$HERE/claude-mic" --forget 8>&-
+                    close_stream
+                    open_stream
+                    stream_up=$SECONDS
+                    last_heard=$SECONDS
+                fi
+            else
+                # The capture stream ended — headset asleep, device
+                # reconfigured, recorder killed. Rebuild rather than exit: a
+                # listener that quits silently looks identical to a broken one.
+                # But a stream that dies IMMEDIATELY (mic unplugged for the
+                # evening) must not become a 1 Hz respawn loop, so quick
+                # deaths back off toward a minute between attempts.
+                if (( SECONDS - stream_up >= 10 )); then
+                    backoff=1
+                    log "capture stream ended — restarting it"
+                else
+                    backoff=$(( backoff * 2 )); (( backoff > 60 )) && backoff=60
+                    log "capture stream died within 10s — retrying in ${backoff}s"
+                    (( backoff == 60 )) && notify critical 5000 "mic unavailable — still retrying"
+                fi
+                close_stream
+                nap "$backoff"
+                open_stream
+                stream_up=$SECONDS
+            fi
+        fi
+    done
+}
+
+usage() {
+    cat >&2 <<EOF
+usage: claude-listen [--toggle|--start|--stop|--status|--run]
+
+  --toggle   start listening, or stop if already listening (bind this to a key)
+  --start    start listening in the background
+  --stop     stop the background listener
+  --status   report whether the listener is running
+  --log      follow the listener's log (what it heard, and how it read it)
+  --run      run in the foreground, logging to stderr (default with no args)
+EOF
+    exit 2
+}
+
+main() {
+    case "${1:-}" in
+        --toggle) if listener_pid >/dev/null; then stop_listener; else start_listener; fi ;;
+        --start)  start_listener ;;
+        --stop)   stop_listener ;;
+        --status) status_listener ;;
+        --log)    tail -n "${2:-40}" -f "$LOGFILE" ;;
+        --run|"") run_listener ;;
+        *)        usage ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

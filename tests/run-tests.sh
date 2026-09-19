@@ -15,6 +15,10 @@ SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")"
 
 # ---------------------------------------------------------------- sandbox ---
 SANDBOX="$(mktemp -d)"
+# A set TMUX makes every tmux client ignore TMUX_TMPDIR and target the caller's
+# real server — running these tests from inside tmux then kills that server
+# (and whoever is in it) via the cleanup trap's kill-server.
+unset TMUX TMUX_PANE
 FAKEBIN="$SANDBOX/bin"
 RUNTIME="$SANDBOX/runtime"          # becomes XDG_RUNTIME_DIR
 CONFHOME="$SANDBOX/config"          # becomes XDG_CONFIG_HOME (empty: no user config leaks)
@@ -32,7 +36,11 @@ cleanup() {
     if [[ -f "$RUNTIME/claude-dictate/rec.pid" ]]; then
         kill "$(cat "$RUNTIME/claude-dictate/rec.pid")" 2>/dev/null
     fi
-    TMUX_TMPDIR="$TMUXDIR" tmux kill-server 2>/dev/null
+    # kill-server by explicit socket path, never by TMUX_TMPDIR: this tmux
+    # build silently falls back to the REAL default socket when TMUX_TMPDIR
+    # names a directory that no longer exists (killed a host session on
+    # 2026-08-19, incident #2). -S errors out instead of falling back.
+    tmux -S "$TMUXDIR/tmux-$(id -u)/default" kill-server 2>/dev/null
     rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
@@ -304,6 +312,181 @@ fi
 kill "$BYSTANDER" 2>/dev/null
 sleep 0.5
 assert_eq "stale pidfile: nothing injected" "" "$(cat "$OUT")"
+
+# --- exec'ing wrapper recorder: the real recorder must still be stopped -----
+# claude-mic execs pw-record, so the recorder's cmdline no longer carries the
+# wrapper's name. The stop press must find it anyway or it records forever.
+printf '#!/usr/bin/env bash\nexec "%s/fake-recorder" "$@"\n' "$FAKEBIN" > "$FAKEBIN/exec-recorder"
+chmod +x "$FAKEBIN/exec-recorder"
+: > "$OUT"
+rm -f "$WAVFILE"
+run_dictate DICTATE_RECORDER="$FAKEBIN/exec-recorder"
+wait_for_wav || fail "exec recorder wrote wav"
+EXEC_REC_PID=$(cat "$PIDFILE" 2>/dev/null || echo 0)
+run_dictate DICTATE_RECORDER="$FAKEBIN/exec-recorder"
+assert_status "exec recorder: stop press exits 0" 0 "$?"
+sleep 0.5
+if kill -0 "$EXEC_REC_PID" 2>/dev/null; then
+    fail "exec recorder: recorder stopped (pid $EXEC_REC_PID still running)"
+    kill "$EXEC_REC_PID" 2>/dev/null
+else
+    pass "exec recorder: recorder stopped"
+fi
+
+# --- the Enter is a separate, delayed keystroke ------------------------------
+# Chained onto the text in one tmux command, the newline is swallowed by the
+# TUI still ingesting the transcript and the message never submits. The gap is
+# the fix, so assert the script actually waits before sending Enter.
+: > "$OUT"
+rm -f "$PIDFILE"
+run_dictate                                   # start
+wait_for_wav || fail "recorder wrote wav (setup)"
+start_ns=$(date +%s%N)
+run_dictate DICTATE_SUBMIT_DELAY=2 FAKE_WHISPER_TEXT='submit delay check'
+elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+if (( elapsed_ms >= 2000 )); then
+    pass "submit delay is honored before Enter"
+else
+    fail "submit delay is honored before Enter" "returned in ${elapsed_ms}ms, expected >=2000ms"
+fi
+if wait_for_out; then
+    assert_eq "delayed submit still injects the transcript" \
+        "submit delay check" "$(cat "$OUT")"
+else
+    fail "delayed submit still injects the transcript (nothing arrived)"
+fi
+
+# --- concurrent sends must not interleave ------------------------------------
+# The submit delay opens a window between a sender's text and its Enter; two
+# unserialized senders (a listener auto-send racing a hotkey dictation) would
+# merge their prompts. inject() holds a lock across the gap, so each message
+# must arrive on its own line.
+run_send() { # run_send(text) — the --send entry point, with a wide gap
+    env -i \
+        HOME="$FAKEHOME" \
+        PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+        XDG_CONFIG_HOME="$CONFHOME" \
+        XDG_RUNTIME_DIR="$RUNTIME" \
+        TMUX_TMPDIR="$TMUXDIR" \
+        DICTATE_MODEL="$MODEL_FILE" \
+        DICTATE_TARGET="$SESSION" \
+        DICTATE_RECORDER="$FAKEBIN/fake-recorder" \
+        DICTATE_SUBMIT_DELAY=0.6 \
+        bash "$SCRIPT" --send "$1" 2>/dev/null
+}
+: > "$OUT"
+run_send "alpha message" &
+run_send "bravo message" &
+wait
+sleep 1
+if [[ "$(sort "$OUT")" == $'alpha message\nbravo message' ]]; then
+    pass "concurrent --send calls do not interleave"
+else
+    fail "concurrent --send calls do not interleave" "got: $(tr '\n' '|' < "$OUT")"
+fi
+
+# --- --send --to: routing into named instances --------------------------------
+# Two panes and a roster mapping names to them: each send must land in its own
+# pane and nowhere else, and an unrostered name must be refused.
+OUT2="$SANDBOX/tmux-out2.txt"
+PANE1=$(TMUX_TMPDIR="$TMUXDIR" tmux display-message -t "=$SESSION:" -p '#{pane_id}')
+PANE2=$(TMUX_TMPDIR="$TMUXDIR" tmux split-window -d -t "=$SESSION:" -P -F '#{pane_id}' "cat >> $OUT2")
+mkdir -p "$RUNTIME/claude-dictate"
+printf 'alpha\t%s\nbravo\t%s\n' "$PANE1" "$PANE2" > "$RUNTIME/claude-dictate/roster"
+
+run_send_to() { # run_send_to(target, text)
+    env -i \
+        HOME="$FAKEHOME" \
+        PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+        XDG_CONFIG_HOME="$CONFHOME" \
+        XDG_RUNTIME_DIR="$RUNTIME" \
+        TMUX_TMPDIR="$TMUXDIR" \
+        DICTATE_MODEL="$MODEL_FILE" \
+        DICTATE_TARGET="$SESSION" \
+        DICTATE_RECORDER="$FAKEBIN/fake-recorder" \
+        DICTATE_SUBMIT_DELAY=0.2 \
+        bash "$SCRIPT" --send --to "$1" "$2" 2>/dev/null
+}
+
+wait_for_out2() {
+    for _ in $(seq 1 50); do
+        [[ -s "$OUT2" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+: > "$OUT"
+run_send_to bravo "for bravo only"
+assert_status "--to a rostered name exits 0" 0 "$?"
+if wait_for_out2; then
+    assert_eq "--to routes to the named pane" "for bravo only" "$(cat "$OUT2")"
+else
+    fail "--to routes to the named pane (nothing arrived)"
+fi
+sleep 0.3
+assert_eq "--to leaves the other pane untouched" "" "$(cat "$OUT")"
+
+: > "$OUT"
+run_send_to "$PANE1" "by pane id"
+assert_status "--to a raw pane id exits 0" 0 "$?"
+if wait_for_out; then
+    assert_eq "--to accepts a raw pane id" "by pane id" "$(cat "$OUT")"
+else
+    fail "--to accepts a raw pane id (nothing arrived)"
+fi
+
+: > "$OUT"; : > "$OUT2"
+run_send_to charlie "into the void"
+st=$?
+if (( st != 0 )); then
+    pass "--to an unrostered name is refused"
+else
+    fail "--to an unrostered name is refused (exit 0)"
+fi
+sleep 0.3
+assert_eq "the refused send reaches no pane" "" "$(cat "$OUT")$(cat "$OUT2")"
+
+# A pane scrolled back with the mouse is in copy mode; send-keys there feeds
+# the text to copy mode's key table and the prompt never sees it.
+: > "$OUT2"
+TMUX_TMPDIR="$TMUXDIR" tmux copy-mode -t "$PANE2"
+run_send_to bravo "typed over a scrollback"
+assert_status "copy-mode pane: send exits 0" 0 "$?"
+if wait_for_out2; then
+    assert_eq "copy-mode pane: text still reaches the prompt" "typed over a scrollback" "$(cat "$OUT2")"
+else
+    fail "copy-mode pane: text still reaches the prompt (nothing arrived)"
+fi
+assert_eq "copy-mode pane: left in normal mode" "0" \
+    "$(TMUX_TMPDIR="$TMUXDIR" tmux display-message -t "$PANE2" -p '#{pane_in_mode}')"
+
+# Per-pane locks: two concurrent sends to DIFFERENT panes must not serialize.
+# Each holds its lock across a 1s submit delay; run in parallel they finish in
+# well under the 2s a shared lock would force (generous bound for slow days).
+: > "$OUT"; : > "$OUT2"
+t0=$(date +%s%N)
+env -i HOME="$FAKEHOME" PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+    XDG_CONFIG_HOME="$CONFHOME" XDG_RUNTIME_DIR="$RUNTIME" TMUX_TMPDIR="$TMUXDIR" \
+    DICTATE_MODEL="$MODEL_FILE" DICTATE_TARGET="$SESSION" \
+    DICTATE_RECORDER="$FAKEBIN/fake-recorder" DICTATE_SUBMIT_DELAY=1 \
+    bash "$SCRIPT" --send --to alpha "to alpha" 2>/dev/null &
+env -i HOME="$FAKEHOME" PATH="$FAKEBIN:/usr/bin:/bin:/usr/local/bin" \
+    XDG_CONFIG_HOME="$CONFHOME" XDG_RUNTIME_DIR="$RUNTIME" TMUX_TMPDIR="$TMUXDIR" \
+    DICTATE_MODEL="$MODEL_FILE" DICTATE_TARGET="$SESSION" \
+    DICTATE_RECORDER="$FAKEBIN/fake-recorder" DICTATE_SUBMIT_DELAY=1 \
+    bash "$SCRIPT" --send --to bravo "to bravo" 2>/dev/null &
+wait
+elapsed_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+if (( elapsed_ms < 1900 )); then
+    pass "sends to different panes run concurrently (${elapsed_ms}ms)"
+else
+    fail "sends to different panes run concurrently (took ${elapsed_ms}ms, a shared lock would take >=2000)"
+fi
+sleep 0.5
+assert_eq "concurrent cross-pane sends both land" "to alpha|to bravo" "$(cat "$OUT")|$(cat "$OUT2")"
+
+rm -f "$RUNTIME/claude-dictate/roster"
 
 # ---------------------------------------------------------------- summary ---
 echo

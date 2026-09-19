@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# claude-speak-hook — Claude Code hook that reads Claude's prose out loud.
+#
+# Wired into ~/.claude/settings.json on three events, because a turn is not one
+# message and interruption needs the same gating as speech:
+#
+#   MessageDisplay    fires for each assistant message as it is displayed —
+#                     including the ones before a tool call, which is what
+#                     makes a long working turn audible instead of silent
+#                     until the end
+#   Stop              fires when the turn ends; the fallback for a Claude Code
+#                     that never emits MessageDisplay
+#   UserPromptSubmit  stops in-flight speech — handled HERE rather than as a
+#                     bare `claude-speak --stop` so it passes the same session
+#                     gate: typing in a work terminal must not cut off the
+#                     dictation session mid-word
+#
+# Gating comes first and cheapest: a user-level hook fires for EVERY Claude
+# Code session on the machine, and MessageDisplay fires per streaming delta,
+# so the common case has to exit before any real work. With a claude-roster
+# focus in effect only the focused pane ever speaks or silences; without one,
+# only the session named by DICTATE_TARGET does.
+set -u
+
+# --- focus/session gate (before anything costs) --------------------------------
+
+# $TMUX_PANE is inherited from the pane claude runs in; query by pane rather
+# than by client, which is ambiguous when several clients are attached.
+pane="${TMUX_PANE:-}"
+[[ -n "$pane" ]] || exit 0
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate"
+
+# When claude-roster is in play, exactly one pane is audible: the focused one.
+# A file read is also cheaper than the tmux query below, which matters because
+# MessageDisplay fires per streaming delta. No focus file means no roster —
+# fall back to the session-name gate, so a single-pane setup behaves as ever.
+focus=$(cat "$RUN_DIR/focus-pane" 2>/dev/null)
+if [[ -n "$focus" ]]; then
+    [[ "$pane" == "$focus" ]] || exit 0
+else
+    session=$(tmux display-message -t "$pane" -p '#{session_name}' 2>/dev/null) || exit 0
+    CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        bash -n "$CONFIG_FILE" 2>/dev/null && { set +u; . "$CONFIG_FILE"; set -u; }
+    fi
+    TARGET="${DICTATE_TARGET:-claude}"
+    [[ "$session" == "$TARGET" ]] || exit 0
+fi
+
+LEDGER_DIR="$RUN_DIR/spoken"
+
+# Resolve the sibling script rather than trusting PATH — a hook's environment
+# doesn't necessarily carry ~/.local/bin.
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+
+payload=$(cat)
+
+
+# One jq pass for the scalars. Every field is forced non-empty ("-" for
+# absent/empty) BEFORE @tsv: tab is IFS whitespace to `read`, so an empty
+# field's adjacent tabs would collapse and shift every later field left —
+# a missing hook_event_name would silently reassign all six.
+IFS=$'\t' read -r event final stop_active session_id message_id index < <(
+    jq -r '[.hook_event_name, (.final // false), (.stop_hook_active // false),
+            .session_id, .message_id, (.index // 0)]
+           | map(tostring | if . == "" or . == "null" then "-" else . end)
+           | @tsv' <<<"$payload" 2>/dev/null)
+[[ -n "${event:-}" ]] || exit 0
+
+# --- the ledger ---------------------------------------------------------------
+
+# One file per Claude session, holding the keys of everything already spoken.
+# Bounded, because a long session would otherwise grow it without limit, and
+# only the recent past can produce a duplicate.
+LEDGER="$LEDGER_DIR/${session_id:-unknown}"
+
+# claim(key) — succeed exactly once per key. Two MessageDisplay events can be
+# in flight at once, so the check and the append have to be one atomic step.
+claim() {
+    local key="$1" rc=0
+    mkdir -p "$LEDGER_DIR"
+    exec 9>>"$LEDGER"
+    flock 9 || return 0
+    if grep -qxF "$key" "$LEDGER" 2>/dev/null; then
+        rc=1
+    else
+        printf '%s\n' "$key" >&9
+        # keep the tail; anything older can't come back around
+        if (( $(wc -l < "$LEDGER" 2>/dev/null || echo 0) > 200 )); then
+            tail -n 100 "$LEDGER" > "$LEDGER.trim" && mv "$LEDGER.trim" "$LEDGER"
+        fi
+    fi
+    exec 9>&-
+    return "$rc"
+}
+
+speak() { # speak(text)
+    [[ -n "$1" ]] || return 0
+    printf '%s' "$1" | "$HERE/claude-speak"
+}
+
+# --- per-event ------------------------------------------------------------------
+
+case "$event" in
+UserPromptSubmit)
+    "$HERE/claude-speak" --stop
+    ;;
+
+MessageDisplay)
+    # A message does NOT arrive whole. It streams as a run of deltas sharing one
+    # message_id, each carrying only its own new text, and ONLY THE LAST is
+    # marked final — so gating on `final` here spoke the closing paragraph of a
+    # long reply and silently dropped everything before it. Every delta is
+    # spoken; `final` marks the end of the run, not the part worth hearing.
+    # A delta's TRAILING newlines are the paragraph boundary this flushes on,
+    # and command substitution eats them — so the value is fenced with a
+    # sentinel, then the single newline `jq -r` appends is taken back off.
+    text=$(jq -r '.delta // empty' <<<"$payload" 2>/dev/null; printf X)
+    text=${text%X}; text=${text%$'\n'}
+    [[ -n "$text" || "$final" == "true" ]] || exit 0
+    idx=${index//[^0-9]/}; idx=${idx:-0}
+
+    # Dedup has to outlive the buffer: the buffer is torn down on final, so a
+    # redelivered final delta would otherwise restart from index 0 and speak
+    # the whole message again. The ledger is bounded and survives the teardown.
+    claim "msg:$message_id:$idx" || exit 0
+
+    # Deltas are buffered until they can be spoken SAFELY, for two reasons that
+    # both need more than one delta in hand: claude-speak strips a code block by
+    # matching a ``` PAIR, so flushing an odd fence count reads the code out
+    # loud, and flushing mid-sentence puts the pause in the wrong place. A flush
+    # wants balanced fences and a paragraph boundary — or `final`, after which
+    # no more text is coming and holding it back would lose it.
+    PARTIAL="$RUN_DIR/partial/${session_id}_${message_id}"
+    mkdir -p "$PARTIAL"
+    # Two deltas can be in flight at once, so each is named by its index and the
+    # run is reassembled in index order rather than in arrival order.
+    [[ -n "$text" ]] && printf '%s' "$text" > "$PARTIAL/$(printf '%06d' "$idx")"
+
+    exec 9>>"$PARTIAL.lock"
+    flock 9 || exit 0
+
+    cursor=$(cat "$PARTIAL/.cursor" 2>/dev/null); cursor=${cursor//[^0-9]/}
+    next=${cursor:-0}; buf=""
+    while [[ -f "$PARTIAL/$(printf '%06d' "$next")" ]]; do
+        chunk=$(cat "$PARTIAL/$(printf '%06d' "$next")"; printf X)
+        buf+="${chunk%X}"; next=$((next + 1))
+    done
+
+    # On final, salvage any index stranded behind a gap (a hook that failed or
+    # timed out) instead of letting the tail go unspoken.
+    if [[ "$final" == "true" ]]; then
+        for f in $(ls "$PARTIAL" 2>/dev/null | grep -E '^[0-9]{6}$' | sort); do
+            (( 10#$f >= next )) || continue
+            chunk=$(cat "$PARTIAL/$f"; printf X); buf+="${chunk%X}"
+            next=$((10#$f + 1))
+        done
+    fi
+
+    flush=""
+    fences=$(grep -o '```' <<<"$buf" | wc -l)
+    if [[ -n "$buf" ]] && (( fences % 2 == 0 )) \
+       && { [[ "$final" == "true" ]] || [[ "$buf" == *$'\n\n' ]]; }; then
+        flush="$buf"; printf '%s' "$next" > "$PARTIAL/.cursor"
+    fi
+    exec 9>&-
+
+    # This marker is how Stop knows the turn was already spoken piecewise.
+    mkdir -p "$LEDGER_DIR"; : > "$LEDGER.md-seen"
+
+    # Outside the lock: claude-speak spools and queues, and a drainer must never
+    # wait on a buffer lock held across a read-aloud.
+    speak "$flush"
+    [[ "$final" == "true" ]] && rm -rf "$PARTIAL" "$PARTIAL.lock"
+    ;;
+
+Stop|-)
+    # A hook that blocked once re-fires as Claude works to satisfy it;
+    # speaking again on the repeat would stutter the same reply.
+    [[ "$stop_active" == "true" ]] && exit 0
+
+    # If MessageDisplay is live for this session, every message was already
+    # spoken as it appeared — including this turn's last one, which is all
+    # Stop carries. Re-hashing text to detect that is unreliable (a joined
+    # multi-part message hashes differently and gets spoken twice); the
+    # marker isn't.
+    [[ -f "$LEDGER.md-seen" ]] && exit 0
+
+    text=$(jq -r '.last_assistant_message // empty' <<<"$payload" 2>/dev/null)
+
+    # Older payloads don't carry the message; fall back to the last text block
+    # in the transcript (tool_use/thinking blocks carry no prose worth
+    # speaking).
+    if [[ -z "$text" ]]; then
+        tp=$(jq -r '.transcript_path // empty' <<<"$payload" 2>/dev/null)
+        [[ -f "$tp" ]] && text=$(jq -r 'select(.type=="assistant")
+            | .message.content[]? | select(.type=="text") | .text' "$tp" 2>/dev/null | tail -40)
+    fi
+
+    [[ -n "$text" ]] || exit 0
+    # Belt against a double Stop for the same turn (text-hash keys are safe
+    # here precisely because this path only runs when MessageDisplay never
+    # does — there's no second speaker to collide with).
+    claim "text:$(printf '%s' "$text" | sha1sum | cut -d' ' -f1)" || exit 0
+    speak "$text"
+    ;;
+esac
+
+exit 0
