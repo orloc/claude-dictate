@@ -203,6 +203,7 @@ not something that runs forever:
 claude-listen --toggle    # on, or off if already on — bind this to a key
 claude-listen --start     # on
 claude-listen --stop      # off
+claude-listen --restart   # off then on, e.g. after the mic changed
 claude-listen --status    # which is it
 claude-listen             # foreground, logging to stderr (for debugging)
 ```
@@ -334,6 +335,42 @@ Everything stays on the machine — whisper is local and nothing is transmitted
 unless it's a command or a dictated message — but "always on" is a real change
 from a hotkey, and worth deciding deliberately rather than by default.
 
+## Tray icon
+
+The tones tell you what just changed; `claude-tray` tells you what's true
+right now. It's a microphone in the system tray:
+
+| icon | means |
+|---|---|
+| grey, slashed | listener off |
+| green | listening, standing by |
+| red | mic open — a transmission, or a push-to-talk recording |
+| amber | listening, but the mic went silent or the capture stream died |
+
+Hover for the details — listener state and who the mic is open for, which
+capture device `claude-mic` resolved (and whether it's still plugged in), and
+the instance roster. Left click toggles the listener. Right click has the
+rest: stop speaking, re-detect the mic (`claude-mic --forget`, then
+`claude-listen --restart` if it's running), focus/kill each instance, spawn,
+reap, the listener log, and mic diagnostics. An action that fails pops up the
+script's error rather than doing nothing.
+
+It holds no state: the listener publishes `listen.state` beside its pidfile,
+tagged with its pid so a file left by a killed listener is ignored. The tray
+reads that and the files the other scripts already keep, and every menu item
+shells out to them. Kill it or restart it whenever.
+
+Needs PyGObject with GTK 3 and an XEmbed system tray (awesome's is one).
+Symlink it and start it with the WM:
+
+```sh
+ln -s "$PWD/claude-dictate/claude-tray" ~/.local/bin/claude-tray
+```
+
+```lua
+awful.spawn.once(os.getenv("HOME") .. "/.local/bin/claude-tray")
+```
+
 ## Config
 
 All env vars, or set them in `~/.config/claude-dictate/config` (all three
@@ -422,6 +459,11 @@ text and `--stop` calls out, with a fake tmux deciding which session the hook
 thinks it's in. Mostly gating and dedup: wrong sessions stay silent, a repeat
 message id is spoken once, an identical *later* reply is still spoken, and
 Stop keeps quiet when MessageDisplay already narrated the turn.
+
+`./tests/run-tray-tests.sh` — the tray's icon and tooltip against a sandbox
+runtime dir, including a state file left by a killed listener, plus its action
+helpers against real child processes: a failure is reported, and a grandchild
+holding stderr can't delay the report. No display needed.
 
 ## License
 
