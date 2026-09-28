@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""claude-tray — a system tray icon for the voice loop.
+
+Shows at a glance what the mic is doing, and puts the controls one click away:
+
+    grey, slashed   listener off
+    green           listening, standing by
+    red             mic open — a transmission, or a push-to-talk recording
+    amber           listening, but the mic went silent or the stream died
+
+Hover for the details: listener state, which capture device is resolved and
+whether it is still plugged in, and the instance roster. Left click toggles
+the listener; right click is the menu.
+
+It only reads what the other scripts already publish in
+$XDG_RUNTIME_DIR/claude-dictate, and every action shells out to them, so the
+tray holds no state of its own and can be killed or restarted at will.
+
+Needs GTK 3 via PyGObject and an XEmbed system tray (awesome's has one).
+Start it from your WM's autostart:
+
+    awful.spawn.once(os.getenv("HOME") .. "/.local/bin/claude-tray")
+"""
+
+import fcntl
+import json
+import math
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import warnings
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+import cairo  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+# StatusIcon is deprecated, but it is the XEmbed tray protocol awesome speaks.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-dictate")
+
+COLORS = {
+    "off": (0.50, 0.50, 0.50),
+    "ok": (0.25, 0.73, 0.31),
+    "live": (0.97, 0.32, 0.29),
+    "warn": (0.82, 0.60, 0.13),
+}
+
+
+def read(name):
+    try:
+        with open(os.path.join(RUN, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def alive(pidfile):
+    pid = read(pidfile)
+    if not pid.isdigit():
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return None
+    return int(pid)
+
+
+def kv(text):
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def ago(since):
+    try:
+        s = max(0, int(time.time()) - int(since))
+    except ValueError:
+        return ""
+    return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
+
+
+def notify(body):
+    try:
+        subprocess.Popen(["notify-send", "-a", "claude-tray", "claude-tray", body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        print(f"claude-tray: {body}", file=sys.stderr)
+
+
+def spawn(argv):
+    """Run argv in the background; a failure is shown, not swallowed.
+
+    stderr goes to a file, not a pipe: a grandchild that outlives the command
+    (spawn can start a tmux server) would hold a pipe open and hang the read.
+    """
+    err = tempfile.TemporaryFile()
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=err, start_new_session=True)
+    except OSError as e:
+        err.close()
+        notify(f"{os.path.basename(argv[0])}: {e.strerror}")
+        return
+
+    def done(_pid, status):
+        err.seek(0)
+        msg = err.read().decode(errors="replace").strip()
+        err.close()
+        if status:
+            notify(msg.splitlines()[-1] if msg else f"{os.path.basename(argv[0])} failed")
+
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, p.pid, done)
+
+
+def run(script, *args):
+    spawn([os.path.join(HERE, script), *args])
+
+
+def terminal(*cmd):
+    term = shlex.split(os.environ.get("TERMINAL", "")) or next(
+        ([t] for t in ("urxvtc", "alacritty", "kitty", "xterm") if shutil.which(t)), None
+    )
+    if term:
+        spawn([*term, "-e", *cmd])
+    else:
+        notify("no terminal found — set $TERMINAL")
+
+
+class Sources:
+    """Capture devices from pactl, refreshed every few seconds rather than every
+    tick — it is a subprocess, and a device appearing is not urgent."""
+
+    def __init__(self):
+        self.names = {}
+        self.stamp = 0.0
+
+    def get(self):
+        if time.monotonic() - self.stamp > 5:
+            self.stamp = time.monotonic()
+            try:
+                out = subprocess.run(
+                    ["pactl", "--format=json", "list", "sources"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout
+                self.names = {s["name"]: s.get("description", s["name"]) for s in json.loads(out)}
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        return self.names
+
+
+class Snapshot:
+    """Everything the icon and tooltip say, read fresh each tick."""
+
+    def __init__(self, sources):
+        self.listen_pid = alive("listen.pid")
+        st = kv(read("listen.state"))
+        if st.get("pid") != str(self.listen_pid):
+            st = {}  # left by a dead listener, or one predating listen.state
+        self.state = st.get("state", "")
+        self.target = st.get("target", "")
+        self.health = st.get("health", "")
+        self.since = st.get("since", "")
+        self.recording = alive("rec.pid") is not None
+
+        self.mic = read("mic")
+        names = sources.get()
+        self.mic_desc = names.get(self.mic, "")
+        self.mic_present = self.mic in names if names else None
+
+        focus = read("focus-pane")
+        self.roster = []
+        for line in read("roster").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                self.roster.append((parts[0], parts[1] == focus))
+
+    def color(self):
+        if self.recording or self.state == "transmitting":
+            return "live"
+        if not self.listen_pid:
+            return "off"
+        if self.health in ("silent", "down") or self.mic_present is False:
+            return "warn"
+        return "ok"
+
+    def tooltip(self):
+        lines = []
+        if self.recording:
+            lines.append("● recording (push-to-talk)")
+        if not self.listen_pid:
+            lines.append("listener: off")
+        elif self.state == "transmitting":
+            lines.append(f"listener: MIC OPEN for {self.target} ({ago(self.since)})")
+        elif self.state:
+            lines.append("listener: standing by")
+        else:
+            lines.append("listener: running")
+        if self.health == "silent":
+            lines.append("  ⚠ mic went silent — re-resolving the device")
+        elif self.health == "down":
+            lines.append("  ⚠ capture stream died — retrying")
+
+        if self.mic:
+            mic = self.mic_desc or self.mic
+            if self.mic_present is False:
+                mic += "  (not connected)"
+            lines.append(f"mic: {mic}")
+        else:
+            lines.append("mic: none resolved by claude-mic")
+
+        if self.roster:
+            names = ", ".join(n + (" (focused)" if f else "") for n, f in self.roster)
+            lines.append(f"instances: {names}")
+        return "\n".join(lines)
+
+
+def draw_icon(size, color, slashed):
+    """A microphone glyph in the state colour."""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    cr.scale(size / 24.0, size / 24.0)
+    r, g, b = COLORS[color]
+
+    # capsule
+    cr.set_source_rgb(r, g, b)
+    x, y, w, h = 8.5, 2, 7, 12
+    rad = w / 2
+    cr.new_sub_path()
+    cr.arc(x + rad, y + rad, rad, math.pi, 0)
+    cr.arc(x + rad, y + h - rad, rad, 0, math.pi)
+    cr.close_path()
+    cr.fill()
+
+    # cradle, stem, base
+    cr.set_line_width(2)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.arc(12, 10.5, 6.5, 0, math.pi)
+    cr.stroke()
+    cr.move_to(12, 17)
+    cr.line_to(12, 21)
+    cr.move_to(8, 21.5)
+    cr.line_to(16, 21.5)
+    cr.stroke()
+
+    if slashed:
+        cr.set_line_width(2.4)
+        cr.move_to(3.5, 3.5)
+        cr.line_to(20.5, 20.5)
+        cr.stroke()
+
+    return Gdk.pixbuf_get_from_surface(surf, 0, 0, size, size)
+
+
+class Tray:
+    def __init__(self):
+        self.sources = Sources()
+        self.size = 22
+        self.drawn = None
+        self.tip = None
+        self.menu = None  # held so it isn't collected while shown
+
+        self.icon = Gtk.StatusIcon()
+        self.icon.set_title("claude-dictate")
+        self.icon.connect("activate", lambda *_: run("claude-listen", "--toggle"))
+        self.icon.connect("popup-menu", self.popup)
+        self.icon.connect("size-changed", self.resized)
+        self.refresh()
+        GLib.timeout_add(1000, self.refresh)
+
+    def resized(self, _icon, size):
+        self.size = size
+        self.drawn = None
+        self.refresh()
+        return True
+
+    def refresh(self):
+        self.snap = Snapshot(self.sources)
+        key = (self.snap.color(), not self.snap.listen_pid, self.size)
+        if key != self.drawn:
+            self.icon.set_from_pixbuf(draw_icon(self.size, key[0], key[1]))
+            self.drawn = key
+        tip = self.snap.tooltip()
+        if tip != self.tip:
+            self.icon.set_tooltip_text(tip)
+            self.tip = tip
+        return True
+
+    def redetect_mic(self):
+        # --forget is a rm, so it's done before the restart can resolve. A
+        # running listener only resolves when it rebuilds its stream.
+        subprocess.run([os.path.join(HERE, "claude-mic"), "--forget"], timeout=5)
+        if self.snap.listen_pid:
+            run("claude-listen", "--restart")
+
+    def popup(self, icon, button, when):
+        self.refresh()
+        s = self.snap
+        menu = Gtk.Menu()
+
+        def item(label, fn=None, parent=menu):
+            mi = Gtk.MenuItem(label=label)
+            if fn:
+                mi.connect("activate", lambda *_: fn())
+            else:
+                mi.set_sensitive(False)
+            parent.append(mi)
+            return mi
+
+        for line in s.tooltip().splitlines():
+            item(line)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item("Stop listening" if s.listen_pid else "Start listening",
+             lambda: run("claude-listen", "--toggle"))
+        item("Stop speaking", lambda: run("claude-speak", "--stop"))
+        item("Re-detect mic", self.redetect_mic)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        for name, focused in s.roster:
+            sub = Gtk.Menu()
+            item("Focus", lambda n=name: run("claude-roster", "focus", n), sub)
+            item("Kill", lambda n=name: run("claude-roster", "kill", n), sub)
+            mi = Gtk.MenuItem(label=f"{name}  ●" if focused else name)
+            mi.set_submenu(sub)
+            menu.append(mi)
+        item("Spawn instance", lambda: run("claude-roster", "spawn"))
+        if s.roster:
+            item("Reap closed panes", lambda: run("claude-roster", "reap"))
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item("Show listener log", lambda: terminal(os.path.join(HERE, "claude-listen"), "--log"))
+        item("Mic diagnostics", lambda: terminal(
+            "bash", "-c", '"$0" --show; read -rp "press enter to close"',
+            os.path.join(HERE, "claude-mic")))
+        item("Quit tray", Gtk.main_quit)
+
+        menu.show_all()
+        self.menu = menu
+        menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, when)
+
+
+def main():
+    if len(sys.argv) > 1:
+        print(__doc__.split("\n\n")[0], file=sys.stderr)
+        print("usage: claude-tray  (no arguments)", file=sys.stderr)
+        return 2
+
+    os.makedirs(RUN, exist_ok=True)
+    lock = open(os.path.join(RUN, "tray.lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("claude-tray: already running", file=sys.stderr)
+        return 1
+
+    Tray()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, Gtk.main_quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
