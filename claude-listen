@@ -824,7 +824,7 @@ status_listener() {
 # ---------------------------------------------------------------------- main --
 
 cleanup() {
-    pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
+    close_stream
     pkill -P $$ 2>/dev/null
     rm -rf "$RUN_DIR"
     rm -f "$STATE_FILE" "$STATE_FILE.tmp"
@@ -842,11 +842,19 @@ open_stream() {
               --margin-db "$MARGIN_DB" --min-db "$MIN_DB" --hang-db "$HANG_DB" \
               --close-ms "$CLOSE_MS" \
               --dead-ms "$DEAD_MS" 8>&-)
+    STREAM_PID=$!
 }
 
+# Kill the recorder too, not just the segmenter. SIGPIPE only reaches a
+# recorder when it next writes, and one whose device vanished never does:
+# each rebuild leaked one, still holding the mic, found seven deep after 12
+# days. Both halves of the pipeline are children of the substitution's shell.
+STREAM_PID=""
 close_stream() {
     exec 3<&-
+    [[ -n "$STREAM_PID" ]] && pkill -P "$STREAM_PID" 2>/dev/null
     pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
+    STREAM_PID=""
     return 0
 }
 

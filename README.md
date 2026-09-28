@@ -465,6 +465,10 @@ runtime dir, including a state file left by a killed listener, plus its action
 helpers against real child processes: a failure is reported, and a grandchild
 holding stderr can't delay the report. No display needed.
 
+`./tests/run-janitor-tests.sh` — the orphaned-recorder sweep: a streaming
+recorder nobody reads is killed, while one with a live reader and a
+push-to-talk one recording to a file are left alone.
+
 ## License
 
 MIT

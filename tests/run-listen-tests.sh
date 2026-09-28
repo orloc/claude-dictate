@@ -635,6 +635,33 @@ wait_for '! kill -0 "$p2" 2>/dev/null'
 if [[ ! -e "$STATE_FILE" ]]; then ok "a stopped listener removes its state"
 else no "a stopped listener removes its state"; fi
 
+# --- recorder leak ------------------------------------------------------------
+# A recorder whose device vanished never writes again, so SIGPIPE never reaches
+# it; closing the stream has to kill it outright. Found in the field as seven
+# orphaned recorders holding the mic. This fake is that recorder: silent
+# forever, and named so it can be counted.
+echo "# recorder leak"
+MARK="idle-rec-$$-$RANDOM"
+printf '#!/bin/bash\nexec -a %s sleep 300\n' "$MARK" > "$FB/idle-recorder"
+chmod +x "$FB/idle-recorder"
+recorders() { pgrep -fc "^$MARK" 2>/dev/null || true; }
+
+env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    DICTATE_WHISPER="$FB/fake-whisper" DICTATE_MODEL="$SANDBOX/model.bin" \
+    DICTATE_RECORDER="$FB/idle-recorder" LISTEN_IDLE_RECHECK=1 \
+    bash "$SCRIPT" --run >"$SANDBOX/leak.log" 2>&1 &
+leaker=$!
+sleep 12   # the idle recheck fires on each 5s read timeout: two rebuilds
+rebuilds=$(grep -c "re-resolving the mic" "$SANDBOX/leak.log")
+live_recs=$(recorders)
+if (( rebuilds >= 2 && live_recs == 1 )); then ok "a rebuilt stream leaves one recorder ($rebuilds rebuilds)"
+else no "a rebuilt stream leaves one recorder" "rebuilds=$rebuilds recorders=$live_recs"; fi
+kill -TERM "$leaker" 2>/dev/null; wait "$leaker" 2>/dev/null
+sleep 0.5
+eq "stopping leaves no recorder" "$(recorders)" "0"
+pkill -f "^$MARK" 2>/dev/null
+
 # --- segmenter: ambient step ---------------------------------------------------
 # Field failure: the noise floor only learned from frames it already considered
 # quiet, so a step-up in ambient noise (wireless hiss, a fan) made EVERY frame

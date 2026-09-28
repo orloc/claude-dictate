@@ -73,6 +73,22 @@ if [[ -f "$WAV" ]]; then
     fi
 fi
 
+# --- stream recorders -------------------------------------------------------
+# A listener's recorder whose segmenter is gone holds the mic with nobody
+# reading: no other process has its stdout pipe open. One that has stopped
+# writing never gets SIGPIPE, so it lives forever (seven found, 12 days old).
+# Only recorders streaming to stdout ("-" last): a push-to-talk one writes
+# rec.wav, and its inherited stdout being unread means nothing.
+pipes=$(find /proc/[0-9]*/fd -maxdepth 1 -lname 'pipe:*' -printf '%h %l\n' 2>/dev/null)
+for pid in $(pgrep -u "$(id -u)" -x pw-record 2>/dev/null); do
+    [[ "$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | tail -n1)" == "-" ]] || continue
+    out=$(readlink "/proc/$pid/fd/1" 2>/dev/null) || continue
+    [[ "$out" == pipe:* ]] || continue
+    awk -v me="/proc/$pid/fd" -v p="$out" '$2 == p && $1 != me { found = 1 } END { exit !found }' \
+        <<<"$pipes" && continue
+    kill "$pid" 2>/dev/null && say "killed orphaned stream recorder $pid (nothing reads its output)"
+done
+
 # --- the listener -----------------------------------------------------------
 lp=$(cat "$LISTEN_PID" 2>/dev/null || true)
 if [[ "$lp" =~ ^[0-9]+$ ]]; then
