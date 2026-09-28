@@ -462,6 +462,26 @@ NOTES=""
 say "hey what about the parser"
 eq "standby speech notifies nothing" "$NOTES" ""
 
+# --- tray state -------------------------------------------------------------
+# claude-tray draws from listen.state, so every transition has to land there.
+echo "# tray state"
+mkdir -p "$(dirname "$STATE_FILE")"
+pump_say() { NEXT_TEXT="$1"; pump "$SANDBOX/nonexistent.wav"; }
+STATE=standby; BUFFER=""; TX_TARGET=""; HEALTH=ok; _PUBLISHED=""
+pump_say "skylark come in"
+eq "opening publishes transmitting" "$(sed -n 's/^state=//p' "$STATE_FILE")" "transmitting"
+eq "the target is published"        "$(sed -n 's/^target=//p' "$STATE_FILE")" "skylark"
+eq "the owner's pid is published"   "$(sed -n 's/^pid=//p' "$STATE_FILE")" "$$"
+sed -i 's/^since=.*/since=1/' "$STATE_FILE"
+pump_say "more words"
+eq "unchanged state is not rewritten" "$(sed -n 's/^since=//p' "$STATE_FILE")" "1"
+pump_say "skylark disregard"
+eq "closing publishes standby"      "$(sed -n 's/^state=//p' "$STATE_FILE")" "standby"
+[[ "$(sed -n 's/^since=//p' "$STATE_FILE")" != 1 ]] && ok "a change re-dates since" || no "a change re-dates since"
+HEALTH=silent; publish_state
+eq "health is published"            "$(sed -n 's/^health=//p' "$STATE_FILE")" "silent"
+HEALTH=ok
+
 # --- listener liveness ------------------------------------------------------
 # A pidfile is a claim, not proof: a crashed listener leaves one behind, and a
 # recycled pid would otherwise make --toggle try to stop a stranger's process.
@@ -585,6 +605,35 @@ missing_out=$(env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
 eq "a missing recorder is refused at startup" "$missing_st" "1"
 if grep -q "recorder not found" <<<"$missing_out"; then ok "the recorder refusal says why"
 else no "the recorder refusal says why" "got: $missing_out"; fi
+
+# --- restart ------------------------------------------------------------------
+# The tray's "re-detect mic" is --restart: the old listener must be gone before
+# the new one asks for the lock, and listen.state must follow the new pid.
+echo "# restart"
+bg() {
+    env -i PATH="$FB:/usr/bin:/bin" HOME="$SANDBOX" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+        DICTATE_WHISPER="$FB/fake-whisper" DICTATE_MODEL="$SANDBOX/model.bin" \
+        DICTATE_RECORDER="$FB/fake-recorder" \
+        bash "$SCRIPT" "$@" >/dev/null 2>&1
+}
+state_pid() { sed -n 's/^pid=//p' "$STATE_FILE" 2>/dev/null; }
+wait_for() { local i; for i in $(seq 50); do eval "$1" && return 0; sleep 0.1; done; return 1; }
+
+bg --start
+wait_for '[[ -n "$(state_pid)" ]]'
+p1=$(cat "$PIDFILE" 2>/dev/null)
+eq "a started listener publishes its state" "$(state_pid)" "$p1"
+bg --restart
+wait_for '[[ -n "$(state_pid)" && "$(state_pid)" != "$p1" ]]'
+p2=$(cat "$PIDFILE" 2>/dev/null)
+if [[ -n "$p2" && "$p2" != "$p1" ]] && ! kill -0 "$p1" 2>/dev/null; then ok "restart replaces the listener"
+else no "restart replaces the listener" "p1=$p1 p2=$p2"; fi
+eq "the state follows the new listener" "$(state_pid)" "$p2"
+bg --stop
+wait_for '! kill -0 "$p2" 2>/dev/null'
+if [[ ! -e "$STATE_FILE" ]]; then ok "a stopped listener removes its state"
+else no "a stopped listener removes its state"; fi
 
 # --- segmenter: ambient step ---------------------------------------------------
 # Field failure: the noise floor only learned from frames it already considered

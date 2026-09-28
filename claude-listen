@@ -99,6 +99,7 @@ TONE_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/tones"
 PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.pid"
 LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.log"
 LISTEN_LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.lock"
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/claude-dictate/listen.state"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-dictate/config"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -452,6 +453,21 @@ BUFFER=""
 TX_START=0
 TX_LAST=0        # when the open transmission last heard a word (see check_timeout)
 TX_TARGET=""     # canonical name the open transmission belongs to
+HEALTH=ok        # ok | silent (capture was digital zeros) | down (stream died)
+
+# What claude-tray draws. Rewritten only on change, so "since" dates the
+# change rather than the latest utterance. pid lets a reader discard a file
+# left behind by a listener that was killed too hard to clean up.
+_PUBLISHED=""
+publish_state() {
+    local now="$STATE $TX_TARGET $HEALTH"
+    [[ "$now" == "$_PUBLISHED" ]] && return 0
+    _PUBLISHED="$now"
+    printf 'pid=%s\nstate=%s\ntarget=%s\nhealth=%s\nsince=%s\n' \
+        "$$" "$STATE" "$TX_TARGET" "$HEALTH" "$EPOCHSECONDS" 2>/dev/null > "$STATE_FILE.tmp" \
+        && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    return 0
+}
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$1" >&2; }
 
@@ -706,6 +722,7 @@ handle() {
 pump() {
     handle "$1"
     check_timeout
+    publish_state
 }
 
 # A missed "out" would otherwise hold the channel open forever, so a long
@@ -788,6 +805,17 @@ stop_listener() {
     notify low 3000 "stopped listening"
 }
 
+# Stop, wait for the lock to be free, start. A plain --stop then --start races:
+# the old listener is still exiting when the new one asks for the lock.
+restart_listener() {
+    local p
+    if p=$(listener_pid); then
+        kill -TERM "$p" 2>/dev/null
+        timeout 5 tail --pid="$p" -f /dev/null 2>/dev/null
+    fi
+    start_listener
+}
+
 status_listener() {
     local p
     if p=$(listener_pid); then echo "listening (pid $p)"; else echo "not listening"; fi
@@ -799,6 +827,7 @@ cleanup() {
     pkill -f "listen-segmenter.py --outdir $RUN_DIR" 2>/dev/null
     pkill -P $$ 2>/dev/null
     rm -rf "$RUN_DIR"
+    rm -f "$STATE_FILE" "$STATE_FILE.tmp"
     [[ "$(cat "$PIDFILE" 2>/dev/null)" == "$$" ]] && rm -f "$PIDFILE"
     return 0
 }
@@ -858,6 +887,7 @@ run_listener() {
     # $RECORDER is a word-split command by design (same contract as
     # claude-dictate); "-" makes pw-record stream to stdout.
     open_stream
+    publish_state
     local stream_up=$SECONDS backoff=1 dead_streak=0 last_heard=$SECONDS
 
     # Read utterances as they close, with a periodic tick so the transmission
@@ -880,6 +910,7 @@ run_listener() {
                 # streak would otherwise post a critical notification every
                 # dead-ms until you noticed the thing you already know.
                 (( dead_streak == 1 )) && notify critical 4000 "mic went silent — switching device"
+                HEALTH=silent; publish_state
                 [[ -x "$HERE/claude-mic" ]] && "$HERE/claude-mic" --forget 8>&-
                 close_stream
                 # Switching devices should be instant, but a mic that is silent
@@ -895,12 +926,17 @@ run_listener() {
                 # next silence is a fresh event and gets told about.
                 dead_streak=0
                 last_heard=$SECONDS
+                HEALTH=ok
                 pump "$wav"
             fi
         else
             st=$?
             if (( st > 128 )); then
                 check_timeout
+                # A rebuilt stream that has gone a full dead window without
+                # another !dead or dying is on a live device.
+                [[ "$HEALTH" != ok ]] && (( SECONDS - stream_up > DEAD_MS / 1000 + 5 )) && HEALTH=ok
+                publish_state
                 # The belt for a stream that is alive, non-zero, and wrong. A
                 # node that disappears should now end the recorder outright
                 # (claude-mic asks for node.dont-reconnect), but PipeWire moving
@@ -933,6 +969,7 @@ run_listener() {
                     log "capture stream died within 10s — retrying in ${backoff}s"
                     (( backoff == 60 )) && notify critical 5000 "mic unavailable — still retrying"
                 fi
+                HEALTH=down; publish_state
                 close_stream
                 nap "$backoff"
                 open_stream
@@ -944,11 +981,12 @@ run_listener() {
 
 usage() {
     cat >&2 <<EOF
-usage: claude-listen [--toggle|--start|--stop|--status|--run]
+usage: claude-listen [--toggle|--start|--stop|--restart|--status|--log|--run]
 
   --toggle   start listening, or stop if already listening (bind this to a key)
   --start    start listening in the background
   --stop     stop the background listener
+  --restart  stop if running, then start (picks up a re-resolved mic)
   --status   report whether the listener is running
   --log      follow the listener's log (what it heard, and how it read it)
   --run      run in the foreground, logging to stderr (default with no args)
@@ -961,6 +999,7 @@ main() {
         --toggle) if listener_pid >/dev/null; then stop_listener; else start_listener; fi ;;
         --start)  start_listener ;;
         --stop)   stop_listener ;;
+        --restart) restart_listener ;;
         --status) status_listener ;;
         --log)    tail -n "${2:-40}" -f "$LOGFILE" ;;
         --run|"") run_listener ;;
